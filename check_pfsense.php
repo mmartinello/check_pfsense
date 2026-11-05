@@ -3324,6 +3324,73 @@ function cp_evaluate_zfs(array $data, array $options): CPResult
 }
 
 /* ======================================================================
+ * Subcommand: memory
+ * ====================================================================== */
+
+const CP_MEMORY_SYSCTLS = [
+    'hw.pagesize',
+    'vm.stats.vm.v_page_count',
+    'vm.stats.vm.v_active_count',
+    'vm.stats.vm.v_wire_count',
+    'vm.stats.vm.v_inactive_count',
+    'vm.stats.vm.v_laundry_count',
+    'vm.stats.vm.v_free_count',
+];
+
+/** @return array{sysctl: string} */
+function cp_collect_memory(array $options): array
+{
+    return ['sysctl' => cp_run_ok(array_merge(['/sbin/sysctl'], CP_MEMORY_SYSCTLS), $options['timeout'])];
+}
+
+function cp_evaluate_memory(array $data, array $options): CPResult
+{
+    $values = cp_parse_sysctl((string) ($data['sysctl'] ?? ''));
+    foreach (CP_MEMORY_SYSCTLS as $name) {
+        if (!isset($values[$name]) || !is_numeric($values[$name])) {
+            return new CPResult(CP_UNKNOWN, "Cannot read sysctl {$name}");
+        }
+    }
+    $page = (int) $values['hw.pagesize'];
+    $total = (int) $values['vm.stats.vm.v_page_count'];
+    if ($total <= 0 || $page <= 0) {
+        return new CPResult(CP_UNKNOWN, 'Invalid memory page count or page size');
+    }
+    $pages = fn (string $name) => (int) $values["vm.stats.vm.v_{$name}_count"];
+
+    // Same formula of mem_usage() (dashboard): inactive and laundry pages
+    // can be freed under pressure, so they count as free memory
+    $used = $total - ($pages('inactive') + $pages('laundry') + $pages('free'));
+    $percent = round($used * 100 / $total, 2);
+    $state = cp_threshold_state($percent, $options['warn'], $options['crit']);
+
+    $bytes = fn (int $count) => (float) $count * $page;
+    $message = sprintf(
+        'Memory %s%% used (%s of %s; active %s, wired %s, inactive %s, laundry %s, free %s)',
+        cp_format_number($percent, 1),
+        cp_format_bytes($bytes($used)),
+        cp_format_bytes($bytes($total)),
+        cp_format_bytes($bytes($pages('active'))),
+        cp_format_bytes($bytes($pages('wire'))),
+        cp_format_bytes($bytes($pages('inactive'))),
+        cp_format_bytes($bytes($pages('laundry'))),
+        cp_format_bytes($bytes($pages('free')))
+    );
+
+    $perfdata = [
+        cp_perf('usage', $percent, '%', $options['warn'], $options['crit'], 0, 100),
+        cp_perf('used', $bytes($used), 'B', null, null, 0, $bytes($total)),
+        cp_perf('active', $bytes($pages('active')), 'B', null, null, 0, $bytes($total)),
+        cp_perf('wired', $bytes($pages('wire')), 'B', null, null, 0, $bytes($total)),
+        cp_perf('inactive', $bytes($pages('inactive')), 'B', null, null, 0, $bytes($total)),
+        cp_perf('laundry', $bytes($pages('laundry')), 'B', null, null, 0, $bytes($total)),
+        cp_perf('free', $bytes($pages('free')), 'B', null, null, 0, $bytes($total)),
+    ];
+
+    return new CPResult($state, $message, $perfdata);
+}
+
+/* ======================================================================
  * Subcommand: carp
  * ====================================================================== */
 
@@ -3993,6 +4060,26 @@ function cp_commands(): array
             'options' => cp_filter_options('pools'),
             'collect' => 'cp_collect_zfs',
             'evaluate' => 'cp_evaluate_zfs',
+        ],
+        'memory' => [
+            'summary' => 'Memory usage',
+            'description' => [
+                'Percentage of memory used, like the dashboard: inactive and laundry',
+                'pages count as free because they can be freed under pressure.',
+                'Wired memory includes the ZFS ARC.',
+                'Perfdata: usage percentage, used, active, wired, inactive, laundry',
+                'and free memory in bytes.',
+            ],
+            'libs' => [],
+            'root' => true,
+            'thresholds' => [
+                'warning' => '80', 'critical' => '90',
+                'help_warning' => 'Warning threshold for the usage percentage',
+                'help_critical' => 'Critical threshold for the usage percentage',
+            ],
+            'options' => [],
+            'collect' => 'cp_collect_memory',
+            'evaluate' => 'cp_evaluate_memory',
         ],
         'carp' => [
             'summary' => 'Status of the CARP virtual IPs',

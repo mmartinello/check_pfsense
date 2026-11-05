@@ -1,0 +1,7 @@
+hw.pagesize: 4096
+vm.stats.vm.v_page_count: 2008131
+vm.stats.vm.v_active_count: 52307
+vm.stats.vm.v_wire_count: 498221
+vm.stats.vm.v_inactive_count: 312004
+vm.stats.vm.v_laundry_count: 1205
+vm.stats.vm.v_free_count: 1140122

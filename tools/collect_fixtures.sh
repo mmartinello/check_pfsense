@@ -275,6 +275,9 @@ cmd_dump sysctl_temperature.txt /sbin/sysctl -q dev.cpu hw.acpi.thermal
 cmd_dump zpool_list.txt /sbin/zpool list -H -p -o name,size,allocated,free,capacity,fragmentation,health
 cmd_dump zpool_status.txt /sbin/zpool status -x
 
+# --- memory
+cmd_dump sysctl_memory.txt /sbin/sysctl hw.pagesize vm.stats.vm.v_page_count vm.stats.vm.v_active_count vm.stats.vm.v_wire_count vm.stats.vm.v_inactive_count vm.stats.vm.v_laundry_count vm.stats.vm.v_free_count
+
 # --- carp
 # Only the fields used by check_pfsense: the VIP password is never exported
 php_dump carp.php '
