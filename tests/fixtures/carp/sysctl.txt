@@ -1,0 +1,2 @@
+net.inet.carp.allow: 1
+net.inet.carp.demotion: 0
