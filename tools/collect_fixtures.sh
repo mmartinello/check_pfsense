@@ -151,6 +151,37 @@ php_dump ipsec.php '
     ], true), ";\n";
 '
 
+# --- wireguard
+# Only fields without secrets; private and preshared keys are removed from
+# the wg dump (contains peer endpoints: anonymize them before sharing)
+php_dump wireguard.php '
+    require_once("config.inc");
+    $pick = fn ($a, $k) => array_intersect_key($a, array_flip($k));
+    $c = config_get_path("installedpackages/wireguard");
+    $tunnels = []; $peers = []; $dump = null;
+    if (is_array($c)) {
+        foreach ((array) ($c["tunnels"]["item"] ?? []) as $t) {
+            if (is_array($t)) { $tunnels[] = $pick($t, ["name", "enabled", "descr", "listenport", "publickey"]); }
+        }
+        foreach ((array) ($c["peers"]["item"] ?? []) as $p) {
+            if (is_array($p)) { $peers[] = $pick($p, ["enabled", "tun", "descr", "endpoint", "port", "persistentkeepalive", "publickey"]); }
+        }
+    }
+    if (is_executable("/usr/bin/wg")) {
+        $lines = [];
+        foreach (explode("\n", (string) shell_exec("/usr/bin/wg show all dump")) as $l) {
+            $f = explode("\t", $l);
+            if (count($f) === 5) { $f[1] = "(hidden)"; } elseif (count($f) === 9) { $f[2] = "(hidden)"; }
+            $lines[] = implode("\t", $f);
+        }
+        $dump = implode("\n", $lines);
+    }
+    echo "<?php\nreturn ", var_export([
+        "installed" => is_array($c) && is_executable("/usr/bin/wg"),
+        "tunnels" => $tunnels, "peers" => $peers, "dump" => $dump, "now" => time(),
+    ], true), ";\n";
+'
+
 # --- carp
 # Only the fields used by check_pfsense: the VIP password is never exported
 php_dump carp.php '

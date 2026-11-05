@@ -1875,6 +1875,198 @@ function cp_evaluate_ipsec(array $data, array $options): CPResult
 }
 
 /* ======================================================================
+ * Subcommand: wireguard
+ * ====================================================================== */
+
+const CP_WG_BIN = '/usr/bin/wg';
+
+/**
+ * Remove the secrets from "wg show all dump": the private key of the
+ * interfaces (field 2 of 5) and the preshared key of the peers (field 3
+ * of 9) are replaced with "(hidden)".
+ */
+function cp_wg_sanitize_dump(string $dump): string
+{
+    $lines = [];
+    foreach (preg_split('/\R/', $dump) as $line) {
+        $fields = explode("\t", $line);
+        if (count($fields) === 5) {
+            $fields[1] = '(hidden)';
+        } elseif (count($fields) === 9) {
+            $fields[2] = '(hidden)';
+        }
+        $lines[] = implode("\t", $fields);
+    }
+    return implode("\n", $lines);
+}
+
+/**
+ * Collect WireGuard data: tunnels and peers of the package configuration
+ * (only fields without secrets) and the sanitized "wg show all dump".
+ *
+ * @return array{installed: bool, tunnels: array, peers: array, dump: ?string, now: int}
+ */
+function cp_collect_wireguard(array $options): array
+{
+    $config = config_get_path('installedpackages/wireguard');
+    if (!is_array($config) || !is_executable(CP_WG_BIN)) {
+        return ['installed' => false, 'tunnels' => [], 'peers' => [], 'dump' => null, 'now' => time()];
+    }
+
+    $pick = fn (array $array, array $keys) => array_intersect_key($array, array_flip($keys));
+    $tunnels = [];
+    foreach ((array) ($config['tunnels']['item'] ?? []) as $tunnel) {
+        if (is_array($tunnel)) {
+            $tunnels[] = $pick($tunnel, ['name', 'enabled', 'descr', 'listenport', 'publickey']);
+        }
+    }
+    $peers = [];
+    foreach ((array) ($config['peers']['item'] ?? []) as $peer) {
+        if (is_array($peer)) {
+            $peers[] = $pick($peer, ['enabled', 'tun', 'descr', 'endpoint', 'port', 'persistentkeepalive', 'publickey']);
+        }
+    }
+
+    $dump = cp_run_ok([CP_WG_BIN, 'show', 'all', 'dump'], $options['timeout']);
+
+    return [
+        'installed' => true,
+        'tunnels' => $tunnels,
+        'peers' => $peers,
+        'dump' => cp_wg_sanitize_dump($dump),
+        'now' => time(),
+    ];
+}
+
+/**
+ * Parse "wg show all dump".
+ *
+ * @return array<string, array{listen_port: string, peers: array<string, array>}>
+ */
+function cp_wg_parse_dump(string $dump): array
+{
+    $interfaces = [];
+    foreach (preg_split('/\R/', trim($dump)) as $line) {
+        $fields = explode("\t", $line);
+        if (count($fields) === 5) {
+            $interfaces[$fields[0]] = ['listen_port' => $fields[3], 'peers' => []];
+        } elseif (count($fields) === 9) {
+            $interfaces[$fields[0]]['listen_port'] ??= '';
+            $interfaces[$fields[0]]['peers'][$fields[1]] = [
+                'endpoint' => $fields[3],
+                'allowed_ips' => $fields[4],
+                'latest_handshake' => (int) $fields[5],
+                'transfer_rx' => (float) $fields[6],
+                'transfer_tx' => (float) $fields[7],
+            ];
+        }
+    }
+    return $interfaces;
+}
+
+/** Human readable duration: 45s, 12m 5s, 3h 2m, 2d 4h. */
+function cp_format_duration(int $seconds): string
+{
+    if ($seconds < 60) {
+        return "{$seconds}s";
+    }
+    if ($seconds < 3600) {
+        return intdiv($seconds, 60) . 'm ' . ($seconds % 60) . 's';
+    }
+    if ($seconds < 86400) {
+        return intdiv($seconds, 3600) . 'h ' . intdiv($seconds % 3600, 60) . 'm';
+    }
+    return intdiv($seconds, 86400) . 'd ' . intdiv($seconds % 86400, 3600) . 'h';
+}
+
+function cp_evaluate_wireguard(array $data, array $options): CPResult
+{
+    if (empty($data['installed'])) {
+        return new CPResult(CP_UNKNOWN, 'WireGuard is not installed (package pfSense-pkg-WireGuard not configured or ' . CP_WG_BIN . ' not found)');
+    }
+
+    $running = cp_wg_parse_dump((string) ($data['dump'] ?? ''));
+    $now = (int) ($data['now'] ?? time());
+
+    $tunnels = [];
+    foreach ((array) ($data['tunnels'] ?? []) as $tunnel) {
+        if (is_array($tunnel) && !empty($tunnel['name']) && ($tunnel['enabled'] ?? '') === 'yes') {
+            $tunnels[(string) $tunnel['name']] = $tunnel;
+        }
+    }
+    if (!$tunnels) {
+        return new CPResult(CP_UNKNOWN, 'No enabled WireGuard tunnels');
+    }
+
+    $items = [];
+    $perfdata = [];
+    $ok = 0;
+    $peers = 0;
+    $include = $options['include'] ?? [];
+    $exclude = $options['exclude'] ?? [];
+
+    // Tunnels not running: all their peers are down
+    foreach ($tunnels as $name => $tunnel) {
+        if (!isset($running[$name]) && cp_filter_match([$name, $tunnel['descr'] ?? ''], $include, $exclude)) {
+            $items[] = ['state' => CP_CRITICAL, 'text' => "{$name} not running", 'detail' => "{$name}: tunnel not running"];
+        }
+    }
+
+    foreach ((array) ($data['peers'] ?? []) as $peer) {
+        if (!is_array($peer) || ($peer['enabled'] ?? '') !== 'yes' || empty($peer['publickey'])) {
+            continue;
+        }
+        $tunnel = (string) ($peer['tun'] ?? '');
+        if (!isset($tunnels[$tunnel], $running[$tunnel])) {
+            continue;
+        }
+        $key = (string) $peer['publickey'];
+        $descr = (string) ($peer['descr'] ?? '');
+        if (!cp_filter_match([$tunnel, $tunnels[$tunnel]['descr'] ?? '', $descr, $key], $include, $exclude)) {
+            continue;
+        }
+
+        $id = $tunnel . '/' . ($descr !== '' ? $descr : substr($key, 0, 8));
+        $perfId = $tunnel . '_' . ($descr !== '' ? $descr : substr($key, 0, 8));
+        $status = $running[$tunnel]['peers'][$key] ?? null;
+        $peers++;
+
+        if ($status === null) {
+            $items[] = ['state' => CP_CRITICAL, 'text' => "{$id} not loaded", 'detail' => "{$id}: peer not loaded in the running tunnel"];
+            continue;
+        }
+
+        $endpoint = ($status['endpoint'] !== '' && $status['endpoint'] !== '(none)') ? $status['endpoint'] : 'no endpoint';
+        $traffic = sprintf('rx %s, tx %s', cp_format_bytes($status['transfer_rx']), cp_format_bytes($status['transfer_tx']));
+
+        if ($status['latest_handshake'] <= 0) {
+            $state = !empty($options['ignore-never']) ? CP_OK : CP_CRITICAL;
+            $text = "{$id} no handshake";
+            $detail = "{$id} ({$endpoint}): no handshake yet, {$traffic}";
+        } else {
+            $age = max(0, $now - $status['latest_handshake']);
+            $state = cp_threshold_state($age, $options['warn'], $options['crit']);
+            $text = "{$id} last handshake " . cp_format_duration($age) . ' ago';
+            $detail = "{$id} ({$endpoint}): last handshake " . cp_format_duration($age) . " ago, {$traffic}";
+            $perfdata[] = cp_perf("{$perfId}_handshake_age", $age, 's', $options['warn'], $options['crit'], 0);
+        }
+        if ($state === CP_OK) {
+            $ok++;
+        }
+        $items[] = ['state' => $state, 'text' => $text, 'detail' => $detail];
+        $perfdata[] = cp_perf("{$perfId}_rx", $status['transfer_rx'], 'c', null, null, 0);
+        $perfdata[] = cp_perf("{$perfId}_tx", $status['transfer_tx'], 'c', null, null, 0);
+    }
+
+    if (!$items) {
+        return new CPResult(CP_UNKNOWN, 'No enabled WireGuard peers match the include/exclude filters');
+    }
+
+    $summary = sprintf('%d/%d WireGuard peers OK', $ok, $peers);
+    return cp_aggregate($items, $summary, $perfdata);
+}
+
+/* ======================================================================
  * Subcommand: carp
  * ====================================================================== */
 
@@ -2274,6 +2466,33 @@ function cp_commands(): array
             'options' => cp_filter_options('tunnels (con1, ikeid, description or remote gateway)'),
             'collect' => 'cp_collect_ipsec',
             'evaluate' => 'cp_evaluate_ipsec',
+        ],
+        'wireguard' => [
+            'summary' => 'Status of the WireGuard tunnels and peers (package)',
+            'description' => [
+                'Age of the latest handshake of every enabled peer of the enabled',
+                'tunnels, from "wg show all dump". CRITICAL if a tunnel is not',
+                'running, if a peer is not loaded or never completed a handshake',
+                '(unless --ignore-never). UNKNOWN if WireGuard is not installed.',
+                'Peers are identified as <tunnel>/<description>; filters match the',
+                'tunnel name or description, the peer description or public key.',
+                'Perfdata: handshake age (s), rx/tx bytes (counters) of every peer.',
+            ],
+            'libs' => ['config.inc'],
+            'root' => true,
+            'thresholds' => [
+                'warning' => '300', 'critical' => '600',
+                'help_warning' => 'Warning threshold for the handshake age in seconds',
+                'help_critical' => 'Critical threshold for the handshake age in seconds',
+            ],
+            'options' => cp_filter_options('tunnels or peers') + [
+                'ignore-never' => [
+                    'type' => 'flag',
+                    'help' => 'Peers that never completed a handshake are OK (example: roaming clients)',
+                ],
+            ],
+            'collect' => 'cp_collect_wireguard',
+            'evaluate' => 'cp_evaluate_wireguard',
         ],
         'carp' => [
             'summary' => 'Status of the CARP virtual IPs',
