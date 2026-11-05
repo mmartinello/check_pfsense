@@ -182,6 +182,11 @@ php_dump wireguard.php '
     ], true), ";\n";
 '
 
+# --- dns (queries the local resolver, like the check)
+cmd_dump drill_ok.txt /usr/bin/drill @127.0.0.1 pfsense.org A
+cmd_dump drill_aaaa.txt /usr/bin/drill @127.0.0.1 pfsense.org AAAA
+cmd_dump drill_nxdomain.txt /usr/bin/drill @127.0.0.1 nonexistent.invalid A
+
 # --- carp
 # Only the fields used by check_pfsense: the VIP password is never exported
 php_dump carp.php '

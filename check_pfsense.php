@@ -2067,6 +2067,125 @@ function cp_evaluate_wireguard(array $data, array $options): CPResult
 }
 
 /* ======================================================================
+ * Subcommand: dns
+ * ====================================================================== */
+
+const CP_DRILL_BIN = '/usr/bin/drill';
+const CP_DNS_DEFAULT_QUERY = 'pfsense.org';
+
+/**
+ * Resolve a name with drill against the local resolver (or --server).
+ *
+ * @return array{output: string, code: int, stderr: string}
+ */
+function cp_collect_dns(array $options): array
+{
+    $result = cp_run([
+        CP_DRILL_BIN,
+        '@' . ($options['server'] ?? '127.0.0.1'),
+        $options['query'] ?? CP_DNS_DEFAULT_QUERY,
+        strtoupper($options['type'] ?? 'A'),
+    ], $options['timeout']);
+
+    return ['output' => $result['stdout'], 'code' => $result['code'], 'stderr' => $result['stderr']];
+}
+
+/**
+ * Parse the output of drill: response code, query time and answers.
+ *
+ * @return array{rcode: ?string, time: ?float, answers: array<int, array{name: string, type: string, data: string}>}
+ */
+function cp_parse_drill(string $output): array
+{
+    $result = ['rcode' => null, 'time' => null, 'answers' => []];
+    $section = null;
+    foreach (preg_split('/\R/', $output) as $line) {
+        if (preg_match('/rcode:\s*([A-Z]+)/', $line, $m)) {
+            $result['rcode'] = $m[1];
+        } elseif (preg_match('/^;; Query time:\s*([0-9.]+)\s*msec/', $line, $m)) {
+            $result['time'] = (float) $m[1];
+        } elseif (preg_match('/^;; ([A-Z]+) SECTION:/', $line, $m)) {
+            $section = $m[1];
+        } elseif ($section === 'ANSWER' && $line !== '' && $line[0] !== ';') {
+            $fields = preg_split('/\s+/', trim($line), 5);
+            if (count($fields) === 5) {
+                $result['answers'][] = ['name' => $fields[0], 'type' => strtoupper($fields[3]), 'data' => $fields[4]];
+            }
+        }
+    }
+    return $result;
+}
+
+function cp_evaluate_dns(array $data, array $options): CPResult
+{
+    $query = $options['query'] ?? CP_DNS_DEFAULT_QUERY;
+    $server = $options['server'] ?? '127.0.0.1';
+    $type = strtoupper($options['type'] ?? 'A');
+    $what = "{$query} {$type} @{$server}";
+
+    $parsed = cp_parse_drill((string) ($data['output'] ?? ''));
+    if ($parsed['rcode'] === null) {
+        $error = trim((string) ($data['stderr'] ?? '')) ?: trim((string) ($data['output'] ?? ''));
+        $lines = array_filter(preg_split('/\R/', $error));
+        return new CPResult(CP_CRITICAL, "DNS query {$what} failed" . ($lines ? ': ' . end($lines) : ''));
+    }
+
+    $perfdata = [];
+    if ($parsed['time'] !== null) {
+        $perfdata[] = cp_perf('time', $parsed['time'], 'ms', $options['warn'], $options['crit'], 0);
+    }
+
+    $addresses = array_values(array_map(
+        fn ($answer) => $answer['data'],
+        array_filter($parsed['answers'], fn ($answer) => $answer['type'] === $type)
+    ));
+    $perfdata[] = cp_perf('answers', count($addresses), '', null, null, 0);
+
+    if ($parsed['rcode'] !== 'NOERROR') {
+        return new CPResult(CP_CRITICAL, "DNS query {$what} returned {$parsed['rcode']}", $perfdata);
+    }
+    if (!$addresses) {
+        return new CPResult(CP_CRITICAL, "DNS query {$what} returned no {$type} records", $perfdata);
+    }
+
+    $list = implode(', ', $addresses);
+    $expect = $options['expect'] ?? [];
+    if ($expect) {
+        $normalize = fn ($ip) => inet_pton($ip) !== false ? inet_ntop(inet_pton($ip)) : strtolower($ip);
+        $found = array_map($normalize, $addresses);
+        $missing = array_values(array_filter($expect, fn ($ip) => !in_array($normalize($ip), $found, true)));
+        if ($missing) {
+            return new CPResult(CP_CRITICAL, "DNS query {$what} returned {$list}, expected " . implode(', ', $missing), $perfdata);
+        }
+    }
+
+    $message = "{$what}: {$list}";
+    if ($parsed['time'] === null) {
+        return new CPResult(CP_UNKNOWN, "{$message} (query time not found in drill output)", $perfdata);
+    }
+    $state = cp_threshold_state($parsed['time'], $options['warn'], $options['crit']);
+    return new CPResult($state, $message . ' in ' . cp_format_number($parsed['time']) . ' ms', $perfdata);
+}
+
+/** Validate the dns options. */
+function cp_validate_dns(array $options): void
+{
+    $query = $options['query'] ?? CP_DNS_DEFAULT_QUERY;
+    if (!preg_match('/^(?=.{1,253}\.?$)([A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9])?\.)*[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9])?\.?$/', $query)) {
+        throw new CPUsageException("Invalid query name '{$query}'");
+    }
+    $server = $options['server'] ?? '127.0.0.1';
+    if (filter_var($server, FILTER_VALIDATE_IP) === false) {
+        throw new CPUsageException("Invalid DNS server '{$server}': an IP address is required");
+    }
+    foreach ($options['expect'] ?? [] as $ip) {
+        if (filter_var($ip, FILTER_VALIDATE_IP) === false) {
+            throw new CPUsageException("Invalid expected address '{$ip}'");
+        }
+    }
+}
+
+/* ======================================================================
  * Subcommand: carp
  * ====================================================================== */
 
@@ -2493,6 +2612,44 @@ function cp_commands(): array
             ],
             'collect' => 'cp_collect_wireguard',
             'evaluate' => 'cp_evaluate_wireguard',
+        ],
+        'dns' => [
+            'summary' => 'Name resolution through the local DNS resolver',
+            'description' => [
+                'Resolves a name with drill (default: ' . CP_DNS_DEFAULT_QUERY . ' A @127.0.0.1).',
+                'CRITICAL if the query fails, if the response code is not NOERROR,',
+                'if there are no records of the requested type or if one of the',
+                'expected addresses is missing. -w/-c on the query time in ms.',
+                'Perfdata: query time (ms) and number of records.',
+            ],
+            'libs' => [],
+            'root' => true,
+            'thresholds' => [
+                'warning' => '500', 'critical' => '2000',
+                'help_warning' => 'Warning threshold for the query time in ms',
+                'help_critical' => 'Critical threshold for the query time in ms',
+            ],
+            'options' => [
+                'query' => [
+                    'type' => 'string', 'metavar' => 'NAME',
+                    'help' => 'Name to resolve, default: ' . CP_DNS_DEFAULT_QUERY,
+                ],
+                'type' => [
+                    'type' => 'choice', 'choices' => ['a', 'aaaa'], 'default' => 'a', 'metavar' => 'TYPE',
+                    'help' => 'Record type, default: a',
+                ],
+                'server' => [
+                    'type' => 'string', 'metavar' => 'IP',
+                    'help' => 'DNS server to query, default: 127.0.0.1 (the local resolver)',
+                ],
+                'expect' => [
+                    'type' => 'list', 'metavar' => 'IP',
+                    'help' => 'Comma separated addresses that must be in the answer',
+                ],
+            ],
+            'validate' => 'cp_validate_dns',
+            'collect' => 'cp_collect_dns',
+            'evaluate' => 'cp_evaluate_dns',
         ],
         'carp' => [
             'summary' => 'Status of the CARP virtual IPs',

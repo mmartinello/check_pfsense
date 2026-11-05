@@ -1,0 +1,16 @@
+;; ->>HEADER<<- opcode: QUERY, rcode: NXDOMAIN, id: 7710
+;; flags: qr rd ra ; QUERY: 1, ANSWER: 0, AUTHORITY: 1, ADDITIONAL: 0 
+;; QUESTION SECTION:
+;; nonexistent.example.	IN	A
+
+;; ANSWER SECTION:
+
+;; AUTHORITY SECTION:
+.	86400	IN	SOA	a.root-servers.net. nstld.verisign-grs.com. 2026110500 1800 900 604800 86400
+
+;; ADDITIONAL SECTION:
+
+;; Query time: 31 msec
+;; SERVER: 127.0.0.1
+;; WHEN: Thu Nov  5 21:00:02 2026
+;; MSG SIZE  rcvd: 125

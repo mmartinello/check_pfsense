@@ -1,0 +1,16 @@
+;; ->>HEADER<<- opcode: QUERY, rcode: NOERROR, id: 3311
+;; flags: qr rd ra ; QUERY: 1, ANSWER: 1, AUTHORITY: 0, ADDITIONAL: 0 
+;; QUESTION SECTION:
+;; pfsense.org.	IN	AAAA
+
+;; ANSWER SECTION:
+pfsense.org.	300	IN	AAAA	2001:db8:0:0::80
+
+;; AUTHORITY SECTION:
+
+;; ADDITIONAL SECTION:
+
+;; Query time: 12 msec
+;; SERVER: 127.0.0.1
+;; WHEN: Thu Nov  5 21:00:03 2026
+;; MSG SIZE  rcvd: 57
