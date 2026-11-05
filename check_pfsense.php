@@ -3011,6 +3011,100 @@ function cp_evaluate_notices(array $data, array $options): CPResult
 }
 
 /* ======================================================================
+ * Subcommand: crash
+ * ====================================================================== */
+
+const CP_CRASH_DIR = '/var/crash';
+const CP_PHP_ERRORS_LOG = '/tmp/PHP_errors.log';
+
+/**
+ * Collect the crash data checked by the GUI: the files in /var/crash and
+ * the PHP error log. Nothing is removed.
+ *
+ * @return array{files: array, php_errors: ?array}
+ */
+function cp_collect_crash(array $options): array
+{
+    $files = [];
+    foreach (glob(CP_CRASH_DIR . '/*') ?: [] as $file) {
+        $files[] = ['name' => basename($file), 'size' => (int) @filesize($file), 'mtime' => (int) @filemtime($file)];
+    }
+
+    $phpErrors = null;
+    if (is_file(CP_PHP_ERRORS_LOG)) {
+        $size = (int) @filesize(CP_PHP_ERRORS_LOG);
+        $tail = '';
+        if ($size > 0 && ($fp = @fopen(CP_PHP_ERRORS_LOG, 'r'))) {
+            fseek($fp, max(0, $size - 4096));
+            $tail = (string) stream_get_contents($fp);
+            fclose($fp);
+        }
+        $phpErrors = ['size' => $size, 'mtime' => (int) @filemtime(CP_PHP_ERRORS_LOG), 'tail' => $tail];
+    }
+
+    return ['files' => $files, 'php_errors' => $phpErrors];
+}
+
+/**
+ * Crash report files, with the same filter of cleanup_crash_file_list()
+ * in guiconfig.inc (unanchored regex, like the GUI).
+ */
+function cp_crash_files(array $files): array
+{
+    return array_values(array_filter(
+        $files,
+        fn ($file) => is_array($file) && isset($file['name']) && preg_match('/.*.last|bounds|minfree/', $file['name']) !== 1
+    ));
+}
+
+function cp_evaluate_crash(array $data, array $options): CPResult
+{
+    $files = cp_crash_files((array) ($data['files'] ?? []));
+    $php = is_array($data['php_errors'] ?? null) ? $data['php_errors'] : null;
+    $checkPhp = !empty($options['php-errors']);
+    $phpSize = (int) ($php['size'] ?? 0);
+
+    $texts = [];
+    $long = [];
+    if ($files) {
+        usort($files, fn ($a, $b) => ($b['mtime'] ?? 0) <=> ($a['mtime'] ?? 0));
+        $names = array_map(fn ($f) => $f['name'], $files);
+        $texts[] = sprintf(
+            '%d crash report files in %s (latest %s: %s)',
+            count($files),
+            CP_CRASH_DIR,
+            gmdate('Y-m-d H:i', (int) ($files[0]['mtime'] ?? 0)),
+            implode(', ', array_slice($names, 0, 5)) . (count($names) > 5 ? ', ...' : '')
+        );
+        foreach ($files as $f) {
+            $long[] = sprintf('%s/%s: %s, %s UTC', CP_CRASH_DIR, $f['name'], cp_format_bytes((float) ($f['size'] ?? 0)), gmdate('Y-m-d H:i:s', (int) ($f['mtime'] ?? 0)));
+        }
+    }
+
+    if ($checkPhp && $phpSize > 0) {
+        $lines = array_values(array_filter(preg_split('/\R/', trim((string) ($php['tail'] ?? '')))));
+        $last = $lines ? end($lines) : '';
+        $texts[] = sprintf('PHP errors in %s (%s', CP_PHP_ERRORS_LOG, cp_format_bytes($phpSize))
+            . ($last !== '' ? ', last: ' . cp_shorten($last, 150) : '') . ')';
+        foreach (array_slice($lines, -5) as $line) {
+            $long[] = 'PHP error: ' . cp_clean_text($line);
+        }
+    }
+
+    $perfdata = [cp_perf('crash_files', count($files), '', null, null, 0)];
+    if ($checkPhp) {
+        $perfdata[] = cp_perf('php_errors', $phpSize, 'B', null, null, 0);
+    }
+
+    if (!$texts) {
+        $message = 'No crash reports' . ($checkPhp ? ' and no PHP errors' : '');
+        return new CPResult(CP_OK, $message, $perfdata);
+    }
+    $long[] = 'Review and delete the reports in Diagnostics > Crash Reporter (or from the dashboard)';
+    return new CPResult(CP_WARNING, implode('; ', $texts), $perfdata, $long);
+}
+
+/* ======================================================================
  * Subcommand: carp
  * ====================================================================== */
 
@@ -3615,6 +3709,27 @@ function cp_commands(): array
             ],
             'collect' => 'cp_collect_notices',
             'evaluate' => 'cp_evaluate_notices',
+        ],
+        'crash' => [
+            'summary' => 'Crash reports (kernel panic dumps) not yet sent or deleted',
+            'description' => [
+                'WARNING if there are crash report files in ' . CP_CRASH_DIR . ', with the',
+                'same filter of the GUI. With --php-errors, WARNING also if the PHP',
+                'error log (' . CP_PHP_ERRORS_LOG . ') is not empty, like the dashboard.',
+                'Nothing is removed: use Diagnostics > Crash Reporter.',
+                'Perfdata: crash report files, PHP error log size.',
+            ],
+            'libs' => [],
+            'root' => true,
+            'thresholds' => null,
+            'options' => [
+                'php-errors' => [
+                    'type' => 'flag',
+                    'help' => 'Check the PHP error log too, like the dashboard',
+                ],
+            ],
+            'collect' => 'cp_collect_crash',
+            'evaluate' => 'cp_evaluate_crash',
         ],
         'carp' => [
             'summary' => 'Status of the CARP virtual IPs',

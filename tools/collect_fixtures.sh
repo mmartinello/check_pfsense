@@ -264,6 +264,10 @@ cmd_dump ntpq.txt /usr/local/sbin/ntpq -pnw
 # contain names and addresses to anonymize)
 [ -f /tmp/notices/notices.serial ] && cp /tmp/notices/notices.serial "$OUT/notices.serial"
 
+# --- crash (file list only, not the crash dumps)
+cmd_dump crash_files.txt ls -la /var/crash
+cmd_dump php_errors_tail.txt sh -c 'ls -l /tmp/PHP_errors.log && tail -n 20 /tmp/PHP_errors.log'
+
 # --- carp
 # Only the fields used by check_pfsense: the VIP password is never exported
 php_dump carp.php '
