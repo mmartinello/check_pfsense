@@ -188,6 +188,13 @@ The services of Status > Services. A running service is OK, and a stopped servic
 CRITICAL - unbound stopped; 9/10 services running (1 disabled not checked) | 'running'=9;;;0;10 'stopped'=1;;;0;10
 ```
 
+> **Testing from an SSH session:** `sshd` is reported as stopped. pfSense checks most services with `pkill -0 -x <name>` (`pgrep -anx` on 2.7), and `pkill`/`pgrep` skip their own ancestors. In an SSH session the `sshd` daemon is an ancestor of the check (`sshd` → `sshd-session` → shell → `php` → `pkill`). Under NRPE and in the GUI the result is correct. For manual tests, detach the plugin from the session or use **Diagnostics > Command Prompt**:
+>
+> ```sh
+> daemon -o /tmp/services.txt /usr/local/bin/php /usr/local/libexec/nagios/check_pfsense.php services
+> sleep 5; cat /tmp/services.txt
+> ```
+
 ### openvpn
 
 The OpenVPN instances of Status > OpenVPN (disabled instances are skipped).
