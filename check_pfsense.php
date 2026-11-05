@@ -2433,6 +2433,147 @@ function cp_evaluate_updates(array $data, array $options): CPResult
 }
 
 /* ======================================================================
+ * Subcommand: interfaces
+ * ====================================================================== */
+
+/**
+ * Collect the assigned interfaces: configuration (name, description,
+ * enabled), ifconfig output and error counters.
+ *
+ * get_interface_info() is not used: it runs pfctl, ifconfig and other
+ * commands with exec() and without timeout. The link status logic is the
+ * same: flags (UP) and the "status:" line of ifconfig.
+ */
+function cp_collect_interfaces(array $options): array
+{
+    $interfaces = [];
+    foreach (config_get_path('interfaces', []) as $name => $config) {
+        if (!is_array($config)) {
+            continue;
+        }
+        $enabled = isset($config['enable']);
+        $real = $enabled ? (string) get_real_interface($name) : '';
+        $ifconfig = null;
+        $stats = null;
+        if ($real !== '') {
+            $result = cp_run(['/sbin/ifconfig', $real], $options['timeout']);
+            $ifconfig = ($result['code'] === 0) ? $result['stdout'] : null;
+            if ($ifconfig !== null && function_exists('pfSense_get_interface_stats')) {
+                $raw = pfSense_get_interface_stats($real);
+                if (is_array($raw)) {
+                    $stats = array_intersect_key($raw, array_flip(['inerrs', 'outerrs', 'collisions']));
+                }
+            }
+        }
+        $interfaces[] = [
+            'name' => (string) $name,
+            'descr' => (string) ($config['descr'] ?? strtoupper((string) $name)),
+            'hwif' => (string) ($config['if'] ?? ''),
+            'real' => $real,
+            'enabled' => $enabled,
+            'ifconfig' => $ifconfig,
+            'stats' => $stats,
+        ];
+    }
+    return ['interfaces' => $interfaces];
+}
+
+/**
+ * Link status from the ifconfig output, like get_interface_info():
+ * "down" without the UP flag, otherwise the "status:" line if it is not
+ * "active", otherwise "up". "running" and "associated" (wireless) count as
+ * up, like the interfaces dashboard widget.
+ */
+function cp_interface_status(string $ifconfig): string
+{
+    if (!preg_match('/flags=[0-9a-f]+<([^>]*)>/i', $ifconfig, $m) || !in_array('UP', explode(',', $m[1]), true)) {
+        return 'down';
+    }
+    if (preg_match('/^\s*status:\s*(.+?)\s*$/m', $ifconfig, $m)) {
+        $status = strtolower($m[1]);
+        if (!in_array($status, ['active', 'running', 'associated'], true)) {
+            return $status;
+        }
+    }
+    return 'up';
+}
+
+/** Media of the interface from the ifconfig output (example: 1000baseT <full-duplex>). */
+function cp_interface_media(string $ifconfig): string
+{
+    if (preg_match('/^\s*media: .*? \((.*?)\)\s*$/m', $ifconfig, $m)) {
+        return $m[1];
+    }
+    if (preg_match('/^\s*media: Ethernet (.*?)\s*$/m', $ifconfig, $m)) {
+        return $m[1];
+    }
+    return '';
+}
+
+function cp_evaluate_interfaces(array $data, array $options): CPResult
+{
+    $items = [];
+    $perfdata = [];
+    $up = 0;
+    $total = 0;
+
+    foreach ((array) ($data['interfaces'] ?? []) as $if) {
+        if (!is_array($if) || empty($if['enabled']) || empty($if['hwif'])) {
+            continue;
+        }
+        $total++;
+        $names = [$if['name'], $if['descr'], $if['hwif'], $if['real'] ?? ''];
+        if (!cp_filter_match($names, $options['include'] ?? [], $options['exclude'] ?? [])) {
+            continue;
+        }
+
+        $physical = ($if['real'] ?? '') !== '' ? $if['real'] : $if['hwif'];
+        $label = "{$if['descr']} ({$physical})";
+
+        if (($if['ifconfig'] ?? null) === null) {
+            $items[] = ['state' => CP_CRITICAL, 'text' => "{$label} not found", 'detail' => "{$label}: interface not found"];
+            continue;
+        }
+
+        $status = cp_interface_status((string) $if['ifconfig']);
+        $media = cp_interface_media((string) $if['ifconfig']);
+        $stats = is_array($if['stats'] ?? null) ? $if['stats'] : [];
+        $counters = sprintf(
+            'errors in %d, out %d, collisions %d',
+            (int) ($stats['inerrs'] ?? 0),
+            (int) ($stats['outerrs'] ?? 0),
+            (int) ($stats['collisions'] ?? 0)
+        );
+
+        if ($status === 'up') {
+            $up++;
+            $items[] = ['state' => CP_OK, 'text' => "{$label} up", 'detail' => "{$label}: up" . ($media !== '' ? ", {$media}" : '') . ", {$counters}"];
+        } else {
+            $items[] = ['state' => CP_CRITICAL, 'text' => "{$label} {$status}", 'detail' => "{$label}: {$status}, {$counters}"];
+        }
+
+        if ($stats) {
+            $key = $if['descr'];
+            foreach (['inerrs' => 'in_errors', 'outerrs' => 'out_errors', 'collisions' => 'collisions'] as $field => $suffix) {
+                if (isset($stats[$field]) && is_numeric($stats[$field])) {
+                    $perfdata[] = cp_perf("{$key}_{$suffix}", (float) $stats[$field], 'c', null, null, 0);
+                }
+            }
+        }
+    }
+
+    if ($total === 0) {
+        return new CPResult(CP_UNKNOWN, 'No enabled interfaces found');
+    }
+    if (!$items) {
+        return new CPResult(CP_UNKNOWN, 'No interfaces match the include/exclude filters');
+    }
+
+    $summary = sprintf('%d/%d interfaces up', $up, count($items));
+    return cp_aggregate($items, $summary, $perfdata);
+}
+
+/* ======================================================================
  * Subcommand: carp
  * ====================================================================== */
 
@@ -2951,6 +3092,22 @@ function cp_commands(): array
             ],
             'collect' => 'cp_collect_updates',
             'evaluate' => 'cp_evaluate_updates',
+        ],
+        'interfaces' => [
+            'summary' => 'Link status of the assigned and enabled interfaces',
+            'description' => [
+                'CRITICAL if an enabled interface is down (no UP flag), has a link',
+                'status other than active (example: no carrier) or does not exist.',
+                'Disabled interfaces are not checked. Filters match the interface',
+                'name (wan, opt1), the description or the physical interface.',
+                'Perfdata: input/output errors and collisions (counters).',
+            ],
+            'libs' => ['config.inc', 'interfaces.inc'],
+            'root' => true,
+            'thresholds' => null,
+            'options' => cp_filter_options('interfaces (name, description or physical interface)'),
+            'collect' => 'cp_collect_interfaces',
+            'evaluate' => 'cp_evaluate_interfaces',
         ],
         'carp' => [
             'summary' => 'Status of the CARP virtual IPs',

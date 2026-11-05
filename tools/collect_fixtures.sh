@@ -196,6 +196,30 @@ cmd_dump netstat_m.txt /usr/bin/netstat -m
 cmd_dump pkg_query.txt /usr/local/sbin/pkg-static query -a '%n %v'
 cmd_dump pkg_rquery.txt sh -c "/usr/local/sbin/pkg-static rquery -U '%n %v' \$(/usr/local/sbin/pkg-static query -a '%n' | grep -E '^pfSense(-vmware|-base.*|-kernel-.*|-pkg-.*)?\$')"
 
+# --- interfaces
+php_dump interfaces.php '
+    require_once("config.inc");
+    require_once("interfaces.inc");
+    $result = [];
+    foreach (config_get_path("interfaces", []) as $name => $c) {
+        if (!is_array($c)) { continue; }
+        $enabled = isset($c["enable"]);
+        $real = $enabled ? (string) get_real_interface($name) : "";
+        $ifconfig = null; $stats = null;
+        if ($real !== "") {
+            exec("/sbin/ifconfig " . escapeshellarg($real) . " 2>/dev/null", $out, $rc);
+            $ifconfig = ($rc === 0) ? implode("\n", $out) . "\n" : null;
+            unset($out);
+            if ($ifconfig !== null && function_exists("pfSense_get_interface_stats")) {
+                $stats = array_intersect_key((array) pfSense_get_interface_stats($real), array_flip(["inerrs", "outerrs", "collisions"]));
+            }
+        }
+        $result[] = ["name" => (string) $name, "descr" => (string) ($c["descr"] ?? strtoupper($name)), "hwif" => (string) ($c["if"] ?? ""),
+            "real" => $real, "enabled" => $enabled, "ifconfig" => $ifconfig, "stats" => $stats];
+    }
+    echo "<?php\nreturn ", var_export(["interfaces" => $result], true), ";\n";
+'
+
 # --- carp
 # Only the fields used by check_pfsense: the VIP password is never exported
 php_dump carp.php '
