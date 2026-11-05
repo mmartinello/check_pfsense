@@ -66,6 +66,85 @@ php_dump gateways_defaults.php '
 '
 cmd_dump gateways_dpinger_files.txt sh -c 'ls -l /var/run/dpinger_*'
 
+# --- gateway-groups
+php_dump gateway_groups.php '
+    require_once("config.inc");
+    $groups = [];
+    foreach (config_get_path("gateways/gateway_group", []) as $g) {
+        if (!is_array($g)) { continue; }
+        $groups[] = [
+            "name" => $g["name"] ?? "",
+            "descr" => $g["descr"] ?? "",
+            "trigger" => $g["trigger"] ?? "",
+            "item" => array_values((array) ($g["item"] ?? [])),
+        ];
+    }
+    echo "<?php\nreturn ", var_export($groups, true), ";\n";
+'
+
+# --- services
+# get_gateways() (2.8+) may call write_config() through refresh_gateways()
+# when its cache is empty: fill the cache first, like check_pfsense does.
+php_dump services.php '
+    require_once("config.inc");
+    require_once("service-utils.inc");
+    if (function_exists("get_gateways") && !is_array($GLOBALS["GatewaysCache"] ?? null)) {
+        $GLOBALS["GatewaysCache"] = return_gateways_array(true, true, true);
+    }
+    $result = [];
+    foreach (get_services() as $s) {
+        if (!is_array($s) || empty($s["name"])) { continue; }
+        $result[] = [
+            "name" => $s["name"],
+            "description" => html_entity_decode($s["description"] ?? "", ENT_QUOTES),
+            "mode" => $s["mode"] ?? null,
+            "vpnid" => $s["vpnid"] ?? null,
+            "zone" => $s["zone"] ?? null,
+            "running" => (bool) get_service_status($s),
+            "enabled" => (bool) is_service_enabled($s["name"]),
+        ];
+    }
+    echo "<?php\nreturn ", var_export(["services" => $result], true), ";\n";
+'
+# --- carp
+# Only the fields used by check_pfsense: the VIP password is never exported
+php_dump carp.php '
+    require_once("config.inc");
+    require_once("interfaces.inc");
+    require_once("pfsense-utils.inc");
+    $vips = [];
+    $ifconfig = [];
+    foreach (config_get_path("virtualip/vip", []) as $vip) {
+        if (!is_array($vip) || ($vip["mode"] ?? "") !== "carp") { continue; }
+        $real = (string) get_real_interface($vip["interface"]);
+        $vips[] = [
+            "vhid" => (string) ($vip["vhid"] ?? ""),
+            "interface" => (string) $vip["interface"],
+            "interface_descr" => (string) convert_friendly_interface_to_friendly_descr($vip["interface"]),
+            "real_interface" => $real,
+            "subnet" => (string) ($vip["subnet"] ?? ""),
+            "subnet_bits" => (string) ($vip["subnet_bits"] ?? ""),
+            "descr" => (string) ($vip["descr"] ?? ""),
+            "advskew" => (string) ($vip["advskew"] ?? ""),
+        ];
+        if ($real !== "" && !isset($ifconfig[$real])) {
+            $ifconfig[$real] = shell_exec("/sbin/ifconfig " . escapeshellarg($real));
+        }
+    }
+    echo "<?php\nreturn ", var_export([
+        "vips" => $vips,
+        "ifconfig" => $ifconfig,
+        "sysctl" => shell_exec("/sbin/sysctl net.inet.carp.allow net.inet.carp.demotion"),
+        "maintenance" => config_path_enabled("", "virtualip_carp_maintenancemode"),
+    ], true), ";\n";
+'
+
+# --- states
+cmd_dump pfctl_si.txt /sbin/pfctl -si
+cmd_dump pfctl_sm.txt /sbin/pfctl -sm
+
+cmd_dump functions.txt sh -c 'grep -n "^function get_gateways\|^function refresh_gateways\|^function get_gateway_status\|^function return_gateways_status\|^function get_dpinger_status\|^function get_services\|write_config" /etc/inc/gwlb.inc /etc/inc/service-utils.inc'
+
 ARCHIVE="$OUT.tar.gz"
 tar -czf "$ARCHIVE" -C "$(dirname "$OUT")" "$(basename "$OUT")"
 echo "Done: $ARCHIVE"
