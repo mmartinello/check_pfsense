@@ -220,6 +220,43 @@ php_dump interfaces.php '
     echo "<?php\nreturn ", var_export(["interfaces" => $result], true), ";\n";
 '
 
+# --- certificates
+# Only validity dates, subject CN, description and usage: no certificate
+# and no private key (descriptions and CNs may need anonymizing)
+php_dump certificates.php '
+    require_once("config.inc");
+    require_once("certs.inc");
+    require_once("pfsense-utils.inc");
+    require_once("pkg-utils.inc");
+    $pkg = [];
+    foreach ((array) pkg_call_plugins("plugin_certificates", ["type" => "certificates", "event" => "used_certificates"]) as $n => $i) {
+        foreach (array_keys((array) ($i["certificatelist"] ?? [])) as $r) { $pkg[$r][] = $i["pkgname"] ?? $n; }
+    }
+    $checks = [
+        "cert" => ["is_webgui_cert" => "WebGUI", "is_user_cert" => "user", "is_openvpn_server_cert" => "OpenVPN server",
+            "is_openvpn_client_cert" => "OpenVPN client", "is_ipsec_cert" => "IPsec", "is_captiveportal_cert" => "Captive Portal",
+            "is_unbound_cert" => "DNS Resolver", "is_kea_cert" => "Kea DHCP HA"],
+        "ca" => ["is_openvpn_server_ca" => "OpenVPN server", "is_openvpn_client_ca" => "OpenVPN client",
+            "is_ipsec_peer_ca" => "IPsec", "is_ldap_peer_ca" => "LDAP"],
+    ];
+    $out = [];
+    foreach (["cert", "ca"] as $t) {
+        foreach (config_get_path($t, []) as $e) {
+            if (!is_array($e) || empty($e["refid"])) { continue; }
+            $used = [];
+            foreach ($checks[$t] as $f => $l) { if (function_exists($f) && $f($e["refid"])) { $used[] = $l; } }
+            if ($t === "cert") { $used = array_merge($used, $pkg[$e["refid"]] ?? []); }
+            $d = !empty($e["crt"]) ? @openssl_x509_parse(base64_decode($e["crt"])) : false;
+            $out[] = ["type" => $t, "refid" => $e["refid"], "descr" => $e["descr"] ?? "",
+                "subject" => is_array($d) ? (string) ($d["subject"]["CN"] ?? "") : "",
+                "valid_from" => is_array($d) ? $d["validFrom_time_t"] : null,
+                "valid_to" => is_array($d) ? $d["validTo_time_t"] : null,
+                "has_crt" => !empty($e["crt"]), "used_by" => array_values(array_unique($used))];
+        }
+    }
+    echo "<?php\nreturn ", var_export(["certificates" => $out, "now" => time()], true), ";\n";
+'
+
 # --- carp
 # Only the fields used by check_pfsense: the VIP password is never exported
 php_dump carp.php '

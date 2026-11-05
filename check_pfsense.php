@@ -666,6 +666,11 @@ function cp_prepare_options(string $command, array $def, array $options): array
 
     $warn = $options['warning'] ?? $thresholds['warning'] ?? null;
     $crit = $options['critical'] ?? $thresholds['critical'] ?? null;
+    // Metrics where a low value is a problem: a plain number N means "N:"
+    if (!empty($thresholds['low_is_bad'])) {
+        $warn = ($warn !== null && is_numeric($warn)) ? "{$warn}:" : $warn;
+        $crit = ($crit !== null && is_numeric($crit)) ? "{$crit}:" : $crit;
+    }
     $options['warn'] = ($warn !== null) ? CPThreshold::parse((string) $warn, '-w') : null;
     $options['crit'] = ($crit !== null) ? CPThreshold::parse((string) $crit, '-c') : null;
     cp_check_threshold_order($options['warn'], $options['crit']);
@@ -2574,6 +2579,194 @@ function cp_evaluate_interfaces(array $data, array $options): CPResult
 }
 
 /* ======================================================================
+ * Subcommand: certificates
+ * ====================================================================== */
+
+/**
+ * Subject CN and validity of a certificate stored in the configuration
+ * (base64 PEM), like cert_get_dates() and cert_get_subject().
+ *
+ * @return array{subject: string, valid_from: int, valid_to: int}|null
+ */
+function cp_cert_info(string $crt): ?array
+{
+    $pem = base64_decode($crt, true);
+    if ($pem === false || !function_exists('openssl_x509_parse')) {
+        return null;
+    }
+    $details = @openssl_x509_parse($pem);
+    if (!is_array($details) || !isset($details['validTo_time_t'])) {
+        return null;
+    }
+    $subject = $details['subject']['CN'] ?? ($details['name'] ?? '');
+    return [
+        'subject' => is_array($subject) ? implode(', ', $subject) : (string) $subject,
+        'valid_from' => (int) ($details['validFrom_time_t'] ?? 0),
+        'valid_to' => (int) $details['validTo_time_t'],
+    ];
+}
+
+/**
+ * Collect the certificates and CAs of the Certificate Manager with their
+ * validity and usage, like system_certmanager.php: the read-only checks
+ * of certs.inc (cert_in_use() parts) and pkg_call_plugins() once for the
+ * certificates used by packages (example: HAProxy).
+ *
+ * Private keys are never read.
+ */
+function cp_collect_certificates(array $options): array
+{
+    $packageUsage = [];
+    if (function_exists('pkg_call_plugins')) {
+        $plugins = pkg_call_plugins('plugin_certificates', ['type' => 'certificates', 'event' => 'used_certificates']);
+        foreach ((array) $plugins as $pkg => $info) {
+            foreach (array_keys((array) ($info['certificatelist'] ?? [])) as $refid) {
+                $packageUsage[$refid][] = (string) ($info['pkgname'] ?? $pkg);
+            }
+        }
+    }
+
+    $checks = [
+        'cert' => [
+            'is_webgui_cert' => 'WebGUI',
+            'is_user_cert' => 'user',
+            'is_openvpn_server_cert' => 'OpenVPN server',
+            'is_openvpn_client_cert' => 'OpenVPN client',
+            'is_ipsec_cert' => 'IPsec',
+            'is_captiveportal_cert' => 'Captive Portal',
+            'is_unbound_cert' => 'DNS Resolver',
+            'is_kea_cert' => 'Kea DHCP HA',
+        ],
+        'ca' => [
+            'is_openvpn_server_ca' => 'OpenVPN server',
+            'is_openvpn_client_ca' => 'OpenVPN client',
+            'is_ipsec_peer_ca' => 'IPsec',
+            'is_ldap_peer_ca' => 'LDAP',
+        ],
+    ];
+
+    $certificates = [];
+    foreach (['cert', 'ca'] as $type) {
+        foreach (config_get_path($type, []) as $entry) {
+            if (!is_array($entry) || empty($entry['refid'])) {
+                continue;
+            }
+            $refid = (string) $entry['refid'];
+            $usedBy = [];
+            foreach ($checks[$type] as $function => $label) {
+                if (function_exists($function) && $function($refid)) {
+                    $usedBy[] = $label;
+                }
+            }
+            if ($type === 'cert') {
+                $usedBy = array_merge($usedBy, $packageUsage[$refid] ?? []);
+            }
+            $info = !empty($entry['crt']) ? cp_cert_info((string) $entry['crt']) : null;
+            $certificates[] = [
+                'type' => $type,
+                'refid' => $refid,
+                'descr' => (string) ($entry['descr'] ?? ''),
+                'subject' => $info['subject'] ?? '',
+                'valid_from' => $info['valid_from'] ?? null,
+                'valid_to' => $info['valid_to'] ?? null,
+                'has_crt' => !empty($entry['crt']),
+                'used_by' => array_values(array_unique($usedBy)),
+            ];
+        }
+    }
+
+    return ['certificates' => $certificates, 'now' => time()];
+}
+
+function cp_evaluate_certificates(array $data, array $options): CPResult
+{
+    $now = (int) ($data['now'] ?? time());
+    $items = [];
+    $perfdata = [];
+    $ok = 0;
+    $total = 0;
+    $next = null;
+    $labels = [];
+
+    foreach ((array) ($data['certificates'] ?? []) as $cert) {
+        if (!is_array($cert) || !isset($cert['type'], $cert['refid'])) {
+            continue;
+        }
+        if ($cert['type'] === 'ca' && empty($options['include-ca'])) {
+            continue;
+        }
+        // Certificate signing requests without certificate
+        if (empty($cert['has_crt'])) {
+            continue;
+        }
+        $total++;
+        $usedBy = (array) ($cert['used_by'] ?? []);
+        if (!empty($options['only-used']) && !$usedBy) {
+            continue;
+        }
+        $descr = (string) ($cert['descr'] ?? '');
+        if (!cp_filter_match([$descr, (string) ($cert['subject'] ?? ''), (string) $cert['refid']], $options['include'] ?? [], $options['exclude'] ?? [])) {
+            continue;
+        }
+
+        $kind = ($cert['type'] === 'ca') ? 'CA ' : '';
+        $name = $kind . ($descr !== '' ? $descr : $cert['refid']);
+        $usage = $usedBy ? 'used by ' . implode(', ', $usedBy) : 'not used';
+
+        if (!isset($cert['valid_to'])) {
+            $items[] = ['state' => CP_UNKNOWN, 'text' => "{$name} cannot be parsed", 'detail' => "{$name}: cannot parse the certificate ({$usage})"];
+            continue;
+        }
+
+        $validTo = (int) $cert['valid_to'];
+        $days = (int) floor(($validTo - $now) / 86400);
+        $date = gmdate('Y-m-d', $validTo);
+
+        if ($validTo <= $now) {
+            $state = CP_CRITICAL;
+            $text = "{$name} expired " . abs($days) . " days ago ({$date}, {$usage})";
+        } elseif (isset($cert['valid_from']) && (int) $cert['valid_from'] > $now) {
+            $state = CP_WARNING;
+            $text = "{$name} not valid before " . gmdate('Y-m-d', (int) $cert['valid_from']) . " ({$usage})";
+        } else {
+            $state = cp_threshold_state($days, $options['warn'], $options['crit']);
+            $text = "{$name} expires in {$days} days ({$date}, {$usage})";
+        }
+        if ($state === CP_OK) {
+            $ok++;
+        }
+        // Next expiry among the certificates still valid
+        if ($validTo > $now && ($next === null || $validTo < $next['valid_to'])) {
+            $next = ['valid_to' => $validTo, 'days' => $days, 'name' => $name];
+        }
+
+        $subject = ($cert['subject'] ?? '') !== '' ? " CN={$cert['subject']}" : '';
+        $items[] = ['state' => $state, 'text' => $text, 'detail' => "{$name}{$subject}: valid until {$date} ({$days} days), {$usage}"];
+
+        // Unique perfdata labels
+        $label = cp_perf_label(($cert['type'] === 'ca' ? 'ca_' : '') . ($descr !== '' ? $descr : $cert['refid']));
+        if (isset($labels[$label])) {
+            $label .= '_' . cp_perf_label((string) $cert['refid']);
+        }
+        $labels[$label] = true;
+        $perfdata[] = cp_perf("{$label}_days", $days, '', $options['warn'], $options['crit']);
+    }
+
+    if ($total === 0) {
+        return new CPResult(CP_UNKNOWN, 'No certificates found in the Certificate Manager');
+    }
+    if (!$items) {
+        return new CPResult(CP_UNKNOWN, 'No certificates match the filters');
+    }
+
+    $summary = sprintf('%d/%d certificates OK', $ok, count($items));
+    if ($next !== null) {
+        $summary .= ", next expiry in {$next['days']} days ({$next['name']})";
+    }
+    return cp_aggregate($items, $summary, $perfdata);
+}
+
+/* ======================================================================
  * Subcommand: carp
  * ====================================================================== */
 
@@ -3108,6 +3301,36 @@ function cp_commands(): array
             'options' => cp_filter_options('interfaces (name, description or physical interface)'),
             'collect' => 'cp_collect_interfaces',
             'evaluate' => 'cp_evaluate_interfaces',
+        ],
+        'certificates' => [
+            'summary' => 'Expiration of the certificates of the Certificate Manager',
+            'description' => [
+                'Days until the expiration of every certificate (and CA with',
+                '--include-ca). CRITICAL if expired, WARNING if not valid yet.',
+                'The message shows where a certificate is used (WebGUI, OpenVPN,',
+                'IPsec, users, packages...). Filters match the description, the',
+                'subject CN or the refid. Private keys are never read.',
+                'Perfdata: days until the expiration of every certificate.',
+            ],
+            'libs' => ['config.inc', 'certs.inc', 'pfsense-utils.inc', 'pkg-utils.inc'],
+            'root' => true,
+            'thresholds' => [
+                'warning' => '30', 'critical' => '14', 'low_is_bad' => true,
+                'help_warning' => 'Warning if a certificate expires in less than N days (or a range)',
+                'help_critical' => 'Critical if a certificate expires in less than N days (or a range)',
+            ],
+            'options' => cp_filter_options('certificates (description, subject CN or refid)') + [
+                'only-used' => [
+                    'type' => 'flag',
+                    'help' => 'Check only the certificates in use',
+                ],
+                'include-ca' => [
+                    'type' => 'flag',
+                    'help' => 'Check the certificate authorities too',
+                ],
+            ],
+            'collect' => 'cp_collect_certificates',
+            'evaluate' => 'cp_evaluate_certificates',
         ],
         'carp' => [
             'summary' => 'Status of the CARP virtual IPs',
