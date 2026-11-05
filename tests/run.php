@@ -15,6 +15,10 @@ require __DIR__ . '/lib.php';
 
 error_reporting(E_ALL);
 set_error_handler(function (int $severity, string $message, string $file, int $line) {
+    // Errors silenced with @ are not reported by error_reporting()
+    if (!(error_reporting() & $severity)) {
+        return false;
+    }
     throw new ErrorException($message, 0, $severity, $file, $line);
 });
 

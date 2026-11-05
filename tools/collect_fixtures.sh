@@ -260,6 +260,10 @@ php_dump certificates.php '
 # --- ntp
 cmd_dump ntpq.txt /usr/local/sbin/ntpq -pnw
 
+# --- notices (copied as is, get_notices() is not called; messages may
+# contain names and addresses to anonymize)
+[ -f /tmp/notices/notices.serial ] && cp /tmp/notices/notices.serial "$OUT/notices.serial"
+
 # --- carp
 # Only the fields used by check_pfsense: the VIP password is never exported
 php_dump carp.php '

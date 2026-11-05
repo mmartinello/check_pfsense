@@ -2906,6 +2906,111 @@ function cp_evaluate_ntp(array $data, array $options): CPResult
 }
 
 /* ======================================================================
+ * Subcommand: notices
+ * ====================================================================== */
+
+/**
+ * Read the system notices (the bell in the GUI).
+ *
+ * get_notices() is not used: it calls notices_setup(), that can create
+ * the notices directory and files and change their permissions. The
+ * queue file is read directly, without creating objects. Notices are
+ * never removed.
+ *
+ * @return array{exists: bool, raw: ?string}
+ */
+function cp_collect_notices(array $options): array
+{
+    $tmp = function_exists('g_get') ? (string) g_get('tmp_path', '/tmp') : '/tmp';
+    $file = "{$tmp}/notices/notices.serial";
+    if (!is_file($file)) {
+        return ['exists' => false, 'raw' => null];
+    }
+    $raw = @file_get_contents($file);
+    if ($raw === false) {
+        throw new CPException("Cannot read the notices file {$file}");
+    }
+    return ['exists' => true, 'raw' => $raw];
+}
+
+/**
+ * Decode the notices queue (serialized array time => notice, with the
+ * fields encoded with htmlentities() by file_notice()).
+ *
+ * @return array<int, array{time: int, id: string, notice: string, category: string, priority: string}>|null
+ *         null if the data is not valid
+ */
+function cp_parse_notices(string $raw): ?array
+{
+    if (trim($raw) === '') {
+        return [];
+    }
+    $queue = @unserialize($raw, ['allowed_classes' => false]);
+    if (!is_array($queue)) {
+        return null;
+    }
+    $decode = fn ($value) => html_entity_decode((string) $value, ENT_QUOTES | ENT_HTML5);
+    $notices = [];
+    foreach ($queue as $time => $notice) {
+        if (!is_array($notice)) {
+            continue;
+        }
+        $notices[] = [
+            'time' => (int) $time,
+            'id' => $decode($notice['id'] ?? ''),
+            'notice' => $decode($notice['notice'] ?? ''),
+            'category' => $decode($notice['category'] ?? ''),
+            'priority' => $decode($notice['priority'] ?? ''),
+        ];
+    }
+    // Newest first
+    usort($notices, fn ($a, $b) => $b['time'] <=> $a['time']);
+    return $notices;
+}
+
+/** Shorten a text to a maximum length, on one line. */
+function cp_shorten(string $text, int $length): string
+{
+    $text = cp_clean_text($text);
+    return (mb_strlen($text) > $length) ? rtrim(mb_substr($text, 0, $length - 3)) . '...' : $text;
+}
+
+function cp_evaluate_notices(array $data, array $options): CPResult
+{
+    if (empty($data['exists'])) {
+        return new CPResult(CP_OK, 'No system notices', [cp_perf('notices', 0, '', null, null, 0)]);
+    }
+    $notices = cp_parse_notices((string) ($data['raw'] ?? ''));
+    if ($notices === null) {
+        return new CPResult(CP_UNKNOWN, 'Cannot decode the notices file');
+    }
+
+    $notices = array_values(array_filter(
+        $notices,
+        fn ($n) => cp_filter_match([$n['id'], $n['category']], $options['include'] ?? [], $options['exclude'] ?? [])
+    ));
+    $count = count($notices);
+    $perfdata = [cp_perf('notices', $count, '', null, null, 0)];
+    if ($count === 0) {
+        return new CPResult(CP_OK, 'No system notices', $perfdata);
+    }
+
+    $max = max(1, (int) ($options['max-items'] ?? 3));
+    $shown = array_map(
+        fn ($n) => gmdate('Y-m-d H:i', $n['time']) . ' ' . ($n['id'] !== '' ? "[{$n['id']}] " : '') . cp_shorten($n['notice'], 120),
+        array_slice($notices, 0, $max)
+    );
+    $message = "{$count} system notices: " . implode('; ', $shown) . ($count > $max ? sprintf('; and %d more', $count - $max) : '');
+
+    $long = array_map(
+        fn ($n) => gmdate('Y-m-d H:i:s', $n['time']) . " UTC [{$n['category']}" . ($n['id'] !== '' ? "/{$n['id']}" : '') . '] ' . cp_clean_text($n['notice']),
+        $notices
+    );
+
+    return new CPResult(CP_WARNING, $message, $perfdata, $long);
+}
+
+/* ======================================================================
  * Subcommand: carp
  * ====================================================================== */
 
@@ -3490,6 +3595,26 @@ function cp_commands(): array
             'options' => [],
             'collect' => 'cp_collect_ntp',
             'evaluate' => 'cp_evaluate_ntp',
+        ],
+        'notices' => [
+            'summary' => 'System notices (the bell in the GUI)',
+            'description' => [
+                'WARNING if there are system notices, with the newest ones in the',
+                'message and all of them in the long output. Notices are only read,',
+                'never removed. Filters match the notice id or category.',
+                'Perfdata: number of notices.',
+            ],
+            'libs' => ['globals.inc'],
+            'root' => true,
+            'thresholds' => null,
+            'options' => cp_filter_options('notices (id or category)') + [
+                'max-items' => [
+                    'type' => 'int', 'default' => 3, 'metavar' => 'N',
+                    'help' => 'Notices shown in the first line, default: 3',
+                ],
+            ],
+            'collect' => 'cp_collect_notices',
+            'evaluate' => 'cp_evaluate_notices',
         ],
         'carp' => [
             'summary' => 'Status of the CARP virtual IPs',
