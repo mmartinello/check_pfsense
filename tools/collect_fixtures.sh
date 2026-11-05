@@ -271,6 +271,10 @@ cmd_dump php_errors_tail.txt sh -c 'ls -l /tmp/PHP_errors.log && tail -n 20 /tmp
 # --- temperature
 cmd_dump sysctl_temperature.txt /sbin/sysctl -q dev.cpu hw.acpi.thermal
 
+# --- zfs
+cmd_dump zpool_list.txt /sbin/zpool list -H -p -o name,size,allocated,free,capacity,fragmentation,health
+cmd_dump zpool_status.txt /sbin/zpool status -x
+
 # --- carp
 # Only the fields used by check_pfsense: the VIP password is never exported
 php_dump carp.php '

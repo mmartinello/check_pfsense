@@ -3181,6 +3181,149 @@ function cp_evaluate_temperature(array $data, array $options): CPResult
 }
 
 /* ======================================================================
+ * Subcommand: zfs
+ * ====================================================================== */
+
+const CP_ZPOOL_BIN = '/sbin/zpool';
+
+/** @return array{installed: bool, list: string, status: string} */
+function cp_collect_zfs(array $options): array
+{
+    if (!is_executable(CP_ZPOOL_BIN)) {
+        return ['installed' => false, 'list' => '', 'status' => ''];
+    }
+    return [
+        'installed' => true,
+        'list' => cp_run_ok([CP_ZPOOL_BIN, 'list', '-H', '-p', '-o', 'name,size,allocated,free,capacity,fragmentation,health'], $options['timeout']),
+        'status' => cp_run_ok([CP_ZPOOL_BIN, 'status', '-x'], $options['timeout']),
+    ];
+}
+
+/**
+ * Parse "zpool list -H -p -o name,size,allocated,free,capacity,fragmentation,health".
+ *
+ * @return array<int, array{name: string, size: float, allocated: float, free: float, capacity: ?float, fragmentation: ?float, health: string}>
+ */
+function cp_parse_zpool_list(string $output): array
+{
+    $pools = [];
+    $number = fn ($value) => is_numeric(rtrim($value, '%')) ? (float) rtrim($value, '%') : null;
+    foreach (preg_split('/\R/', trim($output)) as $line) {
+        $fields = preg_split('/\t+|\s{2,}/', trim($line));
+        if (count($fields) < 7) {
+            continue;
+        }
+        $pools[] = [
+            'name' => $fields[0],
+            'size' => (float) $number($fields[1]),
+            'allocated' => (float) $number($fields[2]),
+            'free' => (float) $number($fields[3]),
+            'capacity' => $number($fields[4]),
+            'fragmentation' => $number($fields[5]),
+            'health' => strtoupper($fields[6]),
+        ];
+    }
+    return $pools;
+}
+
+/**
+ * Details of the pools reported by "zpool status -x" (pools with errors
+ * or unavailable): pool name => "status" text.
+ *
+ * @return array<string, string>
+ */
+function cp_parse_zpool_status(string $output): array
+{
+    $problems = [];
+    $pool = null;
+    $section = null;
+    foreach (preg_split('/\R/', $output) as $line) {
+        if (preg_match('/^\s*pool:\s*(\S+)/', $line, $m)) {
+            $pool = $m[1];
+            $problems[$pool] = '';
+            $section = null;
+        } elseif ($pool !== null && preg_match('/^\s*(status|state|action|scan|config|errors|see):\s*(.*)$/', $line, $m)) {
+            $section = $m[1];
+            if ($section === 'status') {
+                $problems[$pool] = trim($m[2]);
+            } elseif ($section === 'errors' && !str_starts_with(trim($m[2]), 'No known data errors')) {
+                $problems[$pool] = trim($problems[$pool] . ' Errors: ' . trim($m[2]));
+            }
+        } elseif ($pool !== null && $section === 'status' && trim($line) !== '') {
+            $problems[$pool] .= ' ' . trim($line);
+        }
+    }
+    return $problems;
+}
+
+function cp_evaluate_zfs(array $data, array $options): CPResult
+{
+    if (empty($data['installed'])) {
+        return new CPResult(CP_UNKNOWN, 'ZFS is not available (' . CP_ZPOOL_BIN . ' not found)');
+    }
+    $pools = cp_parse_zpool_list((string) ($data['list'] ?? ''));
+    if (!$pools) {
+        return new CPResult(CP_UNKNOWN, 'No ZFS pools found (UFS installation?)');
+    }
+    $problems = cp_parse_zpool_status((string) ($data['status'] ?? ''));
+
+    $items = [];
+    $perfdata = [];
+    $ok = 0;
+    foreach ($pools as $pool) {
+        $name = $pool['name'];
+        if (!cp_filter_match([$name], $options['include'] ?? [], $options['exclude'] ?? [])) {
+            continue;
+        }
+        $capacity = $pool['capacity'] ?? ($pool['size'] > 0 ? round($pool['allocated'] / $pool['size'] * 100, 1) : 0.0);
+        $usage = sprintf(
+            '%s%% used (%s of %s)',
+            cp_format_number($capacity, 1),
+            cp_format_bytes($pool['allocated']),
+            cp_format_bytes($pool['size'])
+        );
+        $detail = "{$name}: {$pool['health']}, {$usage}"
+            . ($pool['fragmentation'] !== null ? ', fragmentation ' . cp_format_number($pool['fragmentation']) . '%' : '');
+
+        if ($pool['health'] !== 'ONLINE') {
+            $state = CP_CRITICAL;
+            $text = "{$name} {$pool['health']}";
+        } elseif (isset($problems[$name])) {
+            // Online, but reported by zpool status -x (example: data errors)
+            $state = CP_WARNING;
+            $text = "{$name} has errors";
+        } else {
+            $state = cp_threshold_state($capacity, $options['warn'], $options['crit']);
+            $text = "{$name} {$usage}";
+        }
+        if (isset($problems[$name]) && $problems[$name] !== '') {
+            $text .= ' (' . cp_shorten($problems[$name], 120) . ')';
+            $detail .= '; ' . cp_clean_text($problems[$name]);
+        }
+        if ($state === CP_OK) {
+            $ok++;
+        }
+        $items[] = ['state' => $state, 'text' => $text, 'detail' => $detail];
+
+        $perfdata[] = cp_perf("{$name}_capacity", $capacity, '%', $options['warn'], $options['crit'], 0, 100);
+        $perfdata[] = cp_perf("{$name}_allocated", $pool['allocated'], 'B', null, null, 0, $pool['size']);
+        if ($pool['fragmentation'] !== null) {
+            $perfdata[] = cp_perf("{$name}_fragmentation", $pool['fragmentation'], '%', null, null, 0, 100);
+        }
+    }
+
+    if (!$items) {
+        return new CPResult(CP_UNKNOWN, 'No ZFS pools match the include/exclude filters');
+    }
+
+    $summary = sprintf('%d/%d ZFS pools OK', $ok, count($items));
+    if (count($items) === 1 && $items[0]['state'] === CP_OK) {
+        $summary = $items[0]['text'] . ', ONLINE';
+    }
+    return cp_aggregate($items, $summary, $perfdata);
+}
+
+/* ======================================================================
  * Subcommand: carp
  * ====================================================================== */
 
@@ -3830,6 +3973,26 @@ function cp_commands(): array
             ],
             'collect' => 'cp_collect_temperature',
             'evaluate' => 'cp_evaluate_temperature',
+        ],
+        'zfs' => [
+            'summary' => 'Health and capacity of the ZFS pools',
+            'description' => [
+                'CRITICAL if a pool is not ONLINE (DEGRADED, FAULTED...); WARNING if',
+                'an online pool is reported by "zpool status -x" (example: data',
+                'errors); -w/-c on the used capacity percentage. UNKNOWN on UFS',
+                'installations (no pools). Filters match the pool name.',
+                'Perfdata: capacity, allocated bytes and fragmentation of every pool.',
+            ],
+            'libs' => [],
+            'root' => true,
+            'thresholds' => [
+                'warning' => '80', 'critical' => '90',
+                'help_warning' => 'Warning threshold for the used capacity percentage',
+                'help_critical' => 'Critical threshold for the used capacity percentage',
+            ],
+            'options' => cp_filter_options('pools'),
+            'collect' => 'cp_collect_zfs',
+            'evaluate' => 'cp_evaluate_zfs',
         ],
         'carp' => [
             'summary' => 'Status of the CARP virtual IPs',
