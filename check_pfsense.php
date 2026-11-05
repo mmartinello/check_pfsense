@@ -2186,6 +2186,72 @@ function cp_validate_dns(array $options): void
 }
 
 /* ======================================================================
+ * Subcommand: mbuf
+ * ====================================================================== */
+
+/** @return array{netstat: string} */
+function cp_collect_mbuf(array $options): array
+{
+    return ['netstat' => cp_run_ok(['/usr/bin/netstat', '-m'], $options['timeout'])];
+}
+
+/**
+ * Parse "netstat -m": mbuf clusters (current/cache/total/max) and the
+ * denied requests counters.
+ *
+ * @return array{clusters: ?array{current: int, cache: int, total: int, max: int}, denied: ?int}
+ */
+function cp_parse_netstat_m(string $output): array
+{
+    $result = ['clusters' => null, 'denied' => null];
+    foreach (preg_split('/\R/', $output) as $line) {
+        if (preg_match('#^\s*(\d+)/(\d+)/(\d+)/(\d+)\s+mbuf clusters in use#', $line, $m)) {
+            $result['clusters'] = ['current' => (int) $m[1], 'cache' => (int) $m[2], 'total' => (int) $m[3], 'max' => (int) $m[4]];
+        } elseif (preg_match('#^\s*([\d/]+)\s+requests for (mbufs|jumbo clusters) denied#', $line, $m)) {
+            $result['denied'] = ($result['denied'] ?? 0) + array_sum(array_map('intval', explode('/', $m[1])));
+        }
+    }
+    return $result;
+}
+
+function cp_evaluate_mbuf(array $data, array $options): CPResult
+{
+    $parsed = cp_parse_netstat_m((string) ($data['netstat'] ?? ''));
+    $clusters = $parsed['clusters'];
+    if ($clusters === null || $clusters['max'] <= 0) {
+        return new CPResult(CP_UNKNOWN, 'Cannot read the mbuf clusters usage from netstat -m');
+    }
+
+    // Same value of the dashboard: allocated clusters (in use + cache)
+    $percent = round($clusters['total'] / $clusters['max'] * 100, 2);
+    $state = cp_threshold_state($percent, $options['warn'], $options['crit']);
+    $message = sprintf(
+        'mbuf clusters %s%% used (%d/%d, %d in use, %d cached)',
+        cp_format_number($percent, 1),
+        $clusters['total'],
+        $clusters['max'],
+        $clusters['current'],
+        $clusters['cache']
+    );
+
+    $perfdata = [
+        cp_perf('clusters', $clusters['total'], '', null, null, 0, $clusters['max']),
+        cp_perf('clusters_usage', $percent, '%', $options['warn'], $options['crit'], 0, 100),
+        cp_perf('clusters_current', $clusters['current'], '', null, null, 0, $clusters['max']),
+    ];
+
+    if ($parsed['denied'] !== null) {
+        $perfdata[] = cp_perf('denied', $parsed['denied'], 'c', null, null, 0);
+        if ($parsed['denied'] > 0 && empty($options['ignore-denied'])) {
+            $state = cp_worst_state($state, CP_WARNING);
+            $message = "{$parsed['denied']} mbuf requests denied since boot, {$message}";
+        }
+    }
+
+    return new CPResult($state, $message, $perfdata);
+}
+
+/* ======================================================================
  * Subcommand: carp
  * ====================================================================== */
 
@@ -2650,6 +2716,32 @@ function cp_commands(): array
             'validate' => 'cp_validate_dns',
             'collect' => 'cp_collect_dns',
             'evaluate' => 'cp_evaluate_dns',
+        ],
+        'mbuf' => [
+            'summary' => 'Usage of the mbuf clusters',
+            'description' => [
+                'Percentage of mbuf clusters allocated (in use + cached) compared',
+                'with the maximum, like the dashboard (netstat -m). WARNING if there',
+                'are denied mbuf or jumbo cluster requests: the counters are since',
+                'boot, use --ignore-denied to skip them.',
+                'Perfdata: allocated and in use clusters, usage percentage, denied',
+                'requests (counter).',
+            ],
+            'libs' => [],
+            'root' => true,
+            'thresholds' => [
+                'warning' => '80', 'critical' => '90',
+                'help_warning' => 'Warning threshold for the usage percentage',
+                'help_critical' => 'Critical threshold for the usage percentage',
+            ],
+            'options' => [
+                'ignore-denied' => [
+                    'type' => 'flag',
+                    'help' => 'Do not warn about denied requests (counters since boot)',
+                ],
+            ],
+            'collect' => 'cp_collect_mbuf',
+            'evaluate' => 'cp_evaluate_mbuf',
         ],
         'carp' => [
             'summary' => 'Status of the CARP virtual IPs',
