@@ -257,6 +257,9 @@ php_dump certificates.php '
     echo "<?php\nreturn ", var_export(["certificates" => $out, "now" => time()], true), ";\n";
 '
 
+# --- ntp
+cmd_dump ntpq.txt /usr/local/sbin/ntpq -pnw
+
 # --- carp
 # Only the fields used by check_pfsense: the VIP password is never exported
 php_dump carp.php '

@@ -371,6 +371,11 @@ function cp_check_threshold_order(?CPThreshold $warn, ?CPThreshold $crit): void
     if ($lower($warn) && $lower($crit) && $warn->start < $crit->start) {
         throw new CPUsageException("Warning threshold ({$warn->spec}) is lower than critical threshold ({$crit->spec})");
     }
+    // Bounded ranges (example: -100:100 and -500:500): warning inside critical
+    $bounded = fn (CPThreshold $t) => is_finite($t->start) && is_finite($t->end) && $t->start != 0.0;
+    if ($bounded($warn) && $bounded($crit) && ($warn->start < $crit->start || $warn->end > $crit->end)) {
+        throw new CPUsageException("Warning threshold ({$warn->spec}) is wider than critical threshold ({$crit->spec})");
+    }
 }
 
 /** State of a value compared with warning and critical thresholds. */
@@ -670,6 +675,12 @@ function cp_prepare_options(string $command, array $def, array $options): array
     if (!empty($thresholds['low_is_bad'])) {
         $warn = ($warn !== null && is_numeric($warn)) ? "{$warn}:" : $warn;
         $crit = ($crit !== null && is_numeric($crit)) ? "{$crit}:" : $crit;
+    }
+    // Signed metrics (example: time offset): a plain number N means "-N:N"
+    if (!empty($thresholds['symmetric'])) {
+        $symmetric = fn ($value) => ($value !== null && is_numeric($value)) ? '-' . abs((float) $value) . ':' . abs((float) $value) : $value;
+        $warn = $symmetric($warn);
+        $crit = $symmetric($crit);
     }
     $options['warn'] = ($warn !== null) ? CPThreshold::parse((string) $warn, '-w') : null;
     $options['crit'] = ($crit !== null) ? CPThreshold::parse((string) $crit, '-c') : null;
@@ -2767,6 +2778,134 @@ function cp_evaluate_certificates(array $data, array $options): CPResult
 }
 
 /* ======================================================================
+ * Subcommand: ntp
+ * ====================================================================== */
+
+const CP_NTPQ_BIN = '/usr/local/sbin/ntpq';
+
+/** @return array{output: string, code: int, stderr: string} */
+function cp_collect_ntp(array $options): array
+{
+    // Same command of status_ntpd.php (-w: wide output)
+    $result = cp_run([CP_NTPQ_BIN, '-pnw'], $options['timeout']);
+    return ['output' => $result['stdout'], 'code' => $result['code'], 'stderr' => $result['stderr']];
+}
+
+/**
+ * Parse "ntpq -pnw". Long remote names wrap on two lines: they are joined
+ * like status_ntpd.php does.
+ *
+ * @return array<int, array{tally: string, remote: string, refid: string, stratum: int, reach: string, delay: float, offset: float, jitter: float}>
+ */
+function cp_parse_ntpq(string $output): array
+{
+    $lines = preg_split('/\R/', $output);
+    $peers = [];
+    $pending = null;
+    foreach ($lines as $line) {
+        if ($line === '' || str_contains($line, 'remote') && str_contains($line, 'refid') || preg_match('/^=+$/', trim($line))) {
+            continue;
+        }
+        if ($pending !== null) {
+            $line = $pending . ' ' . ltrim($line);
+            $pending = null;
+        }
+        $tally = $line[0];
+        $fields = preg_split('/\s+/', trim(substr($line, 1)));
+        if (count($fields) === 1) {
+            // Wrapped long name: the values are on the next line
+            $pending = $line;
+            continue;
+        }
+        if (count($fields) < 10 || !is_numeric($fields[7]) || !is_numeric($fields[8])) {
+            continue;
+        }
+        $peers[] = [
+            'tally' => $tally,
+            'remote' => $fields[0],
+            'refid' => $fields[1],
+            'stratum' => (int) $fields[2],
+            'reach' => $fields[6],
+            'delay' => (float) $fields[7],
+            'offset' => (float) $fields[8],
+            'jitter' => (float) $fields[9],
+        ];
+    }
+    return $peers;
+}
+
+function cp_evaluate_ntp(array $data, array $options): CPResult
+{
+    $output = (string) ($data['output'] ?? '');
+    $peers = cp_parse_ntpq($output);
+
+    if (!$peers) {
+        // With the header, ntpd answered without peers
+        if (($data['code'] ?? 0) === 0 && preg_match('/^\s*remote\s+refid/m', $output)) {
+            return new CPResult(CP_CRITICAL, 'No NTP peers configured');
+        }
+        $error = trim((string) ($data['stderr'] ?? '')) ?: trim($output);
+        $lines = array_filter(preg_split('/\R/', $error));
+        return new CPResult(CP_CRITICAL, 'ntpd is not responding' . ($lines ? ': ' . end($lines) : ''));
+    }
+
+    // Pool placeholders (refid .POOL.) are not real peers
+    $real = array_values(array_filter($peers, fn ($p) => strtoupper($p['refid']) !== '.POOL.'));
+    $selected = array_values(array_filter($real, fn ($p) => in_array($p['tally'], ['*', 'o'], true)));
+    $candidates = count(array_filter($real, fn ($p) => $p['tally'] === '+'));
+    $reachable = count(array_filter($real, fn ($p) => $p['reach'] !== '0'));
+
+    $perfdata = [
+        cp_perf('peers', count($real), '', null, null, 0),
+        cp_perf('reachable', $reachable, '', null, null, 0, count($real)),
+        cp_perf('candidates', $candidates, '', null, null, 0),
+    ];
+
+    $long = [];
+    $status = [
+        '*' => 'active peer', 'o' => 'PPS peer', '+' => 'candidate', '#' => 'selected',
+        '.' => 'excess', '-' => 'outlier', 'x' => 'false ticker', ' ' => 'unreachable/pending',
+    ];
+    foreach ($real as $p) {
+        $long[] = sprintf(
+            '%s (refid %s, stratum %d): %s, reach %s, delay %sms, offset %sms, jitter %sms',
+            $p['remote'],
+            $p['refid'],
+            $p['stratum'],
+            $status[$p['tally']] ?? "tally '{$p['tally']}'",
+            $p['reach'],
+            cp_format_number($p['delay'], 3),
+            cp_format_number($p['offset'], 3),
+            cp_format_number($p['jitter'], 3)
+        );
+    }
+
+    if (!$selected) {
+        return new CPResult(CP_CRITICAL, sprintf('No NTP peer selected (%d peers, %d reachable)', count($real), $reachable), $perfdata, $long);
+    }
+
+    $peer = $selected[0];
+    $state = cp_threshold_state($peer['offset'], $options['warn'], $options['crit']);
+    array_unshift(
+        $perfdata,
+        cp_perf('offset', $peer['offset'], 'ms', $options['warn'], $options['crit']),
+        cp_perf('jitter', $peer['jitter'], 'ms', null, null, 0),
+        cp_perf('stratum', $peer['stratum'] + 1, '', null, null, 0, 16)
+    );
+
+    $message = sprintf(
+        'synchronized to %s (stratum %d), offset %s ms, %d candidates, %d/%d peers reachable',
+        $peer['remote'],
+        $peer['stratum'],
+        cp_format_number($peer['offset'], 3),
+        $candidates,
+        $reachable,
+        count($real)
+    );
+    return new CPResult($state, $message, $perfdata, $long);
+}
+
+/* ======================================================================
  * Subcommand: carp
  * ====================================================================== */
 
@@ -3331,6 +3470,26 @@ function cp_commands(): array
             ],
             'collect' => 'cp_collect_certificates',
             'evaluate' => 'cp_evaluate_certificates',
+        ],
+        'ntp' => [
+            'summary' => 'NTP synchronization',
+            'description' => [
+                'Peers of ntpd (ntpq -pnw, like Status > NTP). CRITICAL if ntpd does',
+                'not answer or if no peer is selected (active "*" or PPS "o").',
+                '-w/-c on the offset of the selected peer in ms.',
+                'Perfdata: offset, jitter, stratum of this host, peers, reachable',
+                'peers and candidates.',
+            ],
+            'libs' => [],
+            'root' => true,
+            'thresholds' => [
+                'warning' => '100', 'critical' => '500', 'symmetric' => true,
+                'help_warning' => 'Warning threshold for the offset in ms (N means -N:N)',
+                'help_critical' => 'Critical threshold for the offset in ms (N means -N:N)',
+            ],
+            'options' => [],
+            'collect' => 'cp_collect_ntp',
+            'evaluate' => 'cp_evaluate_ntp',
         ],
         'carp' => [
             'summary' => 'Status of the CARP virtual IPs',
