@@ -1682,6 +1682,199 @@ function cp_format_bytes(float $bytes): string
 }
 
 /* ======================================================================
+ * Subcommand: ipsec
+ * ====================================================================== */
+
+/**
+ * Collect IPsec data like status_ipsec.php: phase 1 and phase 2 entries of
+ * the configuration, the charon service status and the security
+ * associations (ipsec_list_sa(), VICI list-sas).
+ *
+ * Only the fields used by the check are kept: no pre-shared keys, no SPIs.
+ *
+ * @return array{running: bool, phase1: array, phase2: array, sas: array}
+ */
+function cp_collect_ipsec(array $options): array
+{
+    foreach (['ipsec_list_sa', 'get_service_status'] as $function) {
+        if (!function_exists($function)) {
+            throw new CPException("Function {$function}() not found: unsupported pfSense version");
+        }
+    }
+
+    $pick = fn (array $array, array $keys) => array_intersect_key($array, array_flip($keys));
+
+    $phase1 = [];
+    foreach (config_get_path('ipsec/phase1', []) as $p1) {
+        if (is_array($p1)) {
+            $phase1[] = $pick($p1, ['ikeid', 'descr', 'disabled', 'mobile', 'iketype', 'splitconn', 'remote-gateway']);
+        }
+    }
+    $phase2 = [];
+    foreach (config_get_path('ipsec/phase2', []) as $p2) {
+        if (is_array($p2)) {
+            $phase2[] = $pick($p2, ['ikeid', 'reqid', 'descr', 'disabled', 'mobile', 'mode']);
+        }
+    }
+
+    $sas = [];
+    $list = ipsec_list_sa();
+    foreach (is_array($list) ? $list : [] as $ikesa) {
+        if (!is_array($ikesa)) {
+            continue;
+        }
+        $sa = $pick($ikesa, ['con-id', 'uniqueid', 'version', 'state', 'remote-host']);
+        $sa['child-sas'] = [];
+        foreach ((array) ($ikesa['child-sas'] ?? []) as $child) {
+            if (is_array($child)) {
+                $sa['child-sas'][] = $pick($child, ['name', 'uniqueid', 'state', 'bytes-in', 'bytes-out']);
+            }
+        }
+        $sas[] = $sa;
+    }
+
+    return [
+        'running' => (bool) get_service_status(['name' => 'ipsec']),
+        'phase1' => $phase1,
+        'phase2' => $phase2,
+        'sas' => $sas,
+    ];
+}
+
+/**
+ * Split a connection id like ipsec_id_by_conid(): "con1" is [1, null],
+ * "con1_5" is [1, 5].
+ *
+ * @return array{0: string, 1: ?string}
+ */
+function cp_ipsec_parse_conid(string $conid): array
+{
+    if (str_starts_with($conid, 'con')) {
+        $conid = substr($conid, 3);
+    }
+    $parts = explode('_', $conid);
+    return [$parts[0], $parts[1] ?? null];
+}
+
+function cp_evaluate_ipsec(array $data, array $options): CPResult
+{
+    // Enabled site to site phase 1 entries
+    $tunnels = [];
+    foreach ((array) ($data['phase1'] ?? []) as $p1) {
+        if (!is_array($p1) || !isset($p1['ikeid']) || isset($p1['disabled']) || isset($p1['mobile'])) {
+            continue;
+        }
+        $ikeid = (string) $p1['ikeid'];
+        $tunnels[$ikeid] = ['p1' => $p1, 'p2' => []];
+    }
+    foreach ((array) ($data['phase2'] ?? []) as $p2) {
+        if (!is_array($p2) || !isset($p2['ikeid'], $p2['reqid'], $tunnels[(string) $p2['ikeid']])) {
+            continue;
+        }
+        if (isset($p2['disabled']) || isset($p2['mobile'])) {
+            continue;
+        }
+        $tunnels[(string) $p2['ikeid']]['p2'][(string) $p2['reqid']] = $p2;
+    }
+
+    if (!$tunnels) {
+        return new CPResult(CP_UNKNOWN, 'No enabled IPsec phase 1 entries (mobile clients are not checked)');
+    }
+    if (empty($data['running'])) {
+        return new CPResult(CP_CRITICAL, 'IPsec daemon (charon) is not running');
+    }
+
+    // Match the security associations, like status_ipsec.php
+    $ikeStates = [];
+    $childUp = [];
+    $bytes = [];
+    $upStates = ['INSTALLED', 'REKEYING', 'REKEYED'];
+    foreach ((array) ($data['sas'] ?? []) as $ikesa) {
+        if (!is_array($ikesa) || !isset($ikesa['con-id'])) {
+            continue;
+        }
+        [$ikeid] = cp_ipsec_parse_conid((string) $ikesa['con-id']);
+        if (!isset($tunnels[$ikeid])) {
+            continue;
+        }
+        $ikeStates[$ikeid][] = strtoupper((string) ($ikesa['state'] ?? ''));
+
+        foreach ((array) ($ikesa['child-sas'] ?? []) as $child) {
+            if (!is_array($child) || !isset($child['name'])) {
+                continue;
+            }
+            [$childIkeid, $reqid] = cp_ipsec_parse_conid((string) $child['name']);
+            $bytes[$ikeid]['in'] = ($bytes[$ikeid]['in'] ?? 0) + (float) ($child['bytes-in'] ?? 0);
+            $bytes[$ikeid]['out'] = ($bytes[$ikeid]['out'] ?? 0) + (float) ($child['bytes-out'] ?? 0);
+            if (isset($child['state']) && !in_array(strtoupper((string) $child['state']), $upStates, true)) {
+                continue;
+            }
+            $p1 = $tunnels[$childIkeid]['p1'] ?? null;
+            if ($reqid !== null) {
+                $childUp[$childIkeid][$reqid] = true;
+            } elseif ($p1 !== null && ($p1['iketype'] ?? '') === 'ikev2' && !isset($p1['splitconn'])) {
+                // IKEv2 without split connections: one child SA for all P2
+                foreach (array_keys($tunnels[$childIkeid]['p2']) as $p2reqid) {
+                    $childUp[$childIkeid][(string) $p2reqid] = true;
+                }
+            }
+        }
+    }
+
+    $items = [];
+    $perfdata = [];
+    $established = 0;
+    foreach ($tunnels as $ikeid => $tunnel) {
+        $p1 = $tunnel['p1'];
+        $id = "con{$ikeid}";
+        $descr = (string) ($p1['descr'] ?? '');
+        if (!cp_filter_match([$id, $ikeid, $descr, (string) ($p1['remote-gateway'] ?? '')], $options['include'] ?? [], $options['exclude'] ?? [])) {
+            continue;
+        }
+        $label = $id . ($descr !== '' ? " ({$descr})" : '');
+
+        $states = $ikeStates[$ikeid] ?? [];
+        $isEstablished = in_array('ESTABLISHED', $states, true);
+        $expected = $tunnel['p2'];
+        $connected = array_intersect_key($expected, $childUp[$ikeid] ?? []);
+        $missing = array_diff_key($expected, $connected);
+        $missingText = implode(', ', array_map(
+            fn ($reqid, $p2) => (($p2['descr'] ?? '') !== '') ? $p2['descr'] : "reqid {$reqid}",
+            array_keys($missing),
+            $missing
+        ));
+
+        $p2Text = sprintf('%d/%d P2 connected', count($connected), count($expected));
+        if (!$isEstablished) {
+            $state = CP_CRITICAL;
+            $text = "{$id} P1 " . ($states ? strtolower(implode('/', array_unique($states))) : 'not connected');
+        } elseif ($missing) {
+            $state = CP_CRITICAL;
+            $text = "{$id} {$p2Text} (missing: {$missingText})";
+        } else {
+            $state = CP_OK;
+            $text = "{$id} established";
+            $established++;
+        }
+        $remote = (string) ($p1['remote-gateway'] ?? '');
+        $detail = $label . ($remote !== '' ? ", remote {$remote}" : '') . ': P1 ' . ($isEstablished ? 'established' : ($states ? strtolower(implode('/', array_unique($states))) : 'not connected'))
+            . ", {$p2Text}" . ($missing ? " (missing: {$missingText})" : '');
+
+        $items[] = ['state' => $state, 'text' => $text, 'detail' => $detail];
+        $perfdata[] = cp_perf("{$id}_p2", count($connected), '', null, null, 0, count($expected));
+        $perfdata[] = cp_perf("{$id}_bytes_in", $bytes[$ikeid]['in'] ?? 0, 'c', null, null, 0);
+        $perfdata[] = cp_perf("{$id}_bytes_out", $bytes[$ikeid]['out'] ?? 0, 'c', null, null, 0);
+    }
+
+    if (!$items) {
+        return new CPResult(CP_UNKNOWN, 'No IPsec tunnels match the include/exclude filters');
+    }
+
+    $summary = sprintf('%d/%d IPsec tunnels established', $established, count($items));
+    return cp_aggregate($items, $summary, $perfdata);
+}
+
+/* ======================================================================
  * Subcommand: carp
  * ====================================================================== */
 
@@ -2064,6 +2257,23 @@ function cp_commands(): array
             },
             'collect' => 'cp_collect_openvpn',
             'evaluate' => 'cp_evaluate_openvpn',
+        ],
+        'ipsec' => [
+            'summary' => 'Status of the IPsec tunnels (phase 1 and phase 2)',
+            'description' => [
+                'CRITICAL if an enabled phase 1 is not established, or if one of its',
+                'enabled phase 2 entries has no installed child SA. CRITICAL if the',
+                'charon daemon is not running. Disabled entries and mobile clients',
+                'are not checked. Tunnels are identified as con<ikeid>; filters match',
+                'the identifier, the ikeid, the description or the remote gateway.',
+                'Perfdata: connected P2 and bytes in/out (counters) of every tunnel.',
+            ],
+            'libs' => ['config.inc', 'ipsec.inc', 'service-utils.inc'],
+            'root' => true,
+            'thresholds' => null,
+            'options' => cp_filter_options('tunnels (con1, ikeid, description or remote gateway)'),
+            'collect' => 'cp_collect_ipsec',
+            'evaluate' => 'cp_evaluate_ipsec',
         ],
         'carp' => [
             'summary' => 'Status of the CARP virtual IPs',

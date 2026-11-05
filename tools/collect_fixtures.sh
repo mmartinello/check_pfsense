@@ -119,6 +119,38 @@ php_dump openvpn.php '
     ], true), ";\n";
 '
 
+# --- ipsec
+# Only the fields used by check_pfsense: no pre-shared keys, no SPIs
+php_dump ipsec.php '
+    require_once("config.inc");
+    require_once("ipsec.inc");
+    require_once("service-utils.inc");
+    $pick = fn ($a, $k) => array_intersect_key($a, array_flip($k));
+    $p1 = []; $p2 = []; $sas = [];
+    foreach (config_get_path("ipsec/phase1", []) as $e) {
+        if (is_array($e)) { $p1[] = $pick($e, ["ikeid", "descr", "disabled", "mobile", "iketype", "splitconn", "remote-gateway"]); }
+    }
+    foreach (config_get_path("ipsec/phase2", []) as $e) {
+        if (is_array($e)) { $p2[] = $pick($e, ["ikeid", "reqid", "descr", "disabled", "mobile", "mode"]); }
+    }
+    $list = ipsec_list_sa();
+    foreach (is_array($list) ? $list : [] as $ike) {
+        if (!is_array($ike)) { continue; }
+        $sa = $pick($ike, ["con-id", "uniqueid", "version", "state", "remote-host"]);
+        $sa["child-sas"] = [];
+        foreach ((array) ($ike["child-sas"] ?? []) as $c) {
+            if (is_array($c)) { $sa["child-sas"][] = $pick($c, ["name", "uniqueid", "state", "bytes-in", "bytes-out"]); }
+        }
+        $sas[] = $sa;
+    }
+    echo "<?php\nreturn ", var_export([
+        "running" => (bool) get_service_status(["name" => "ipsec"]),
+        "phase1" => $p1,
+        "phase2" => $p2,
+        "sas" => $sas,
+    ], true), ";\n";
+'
+
 # --- carp
 # Only the fields used by check_pfsense: the VIP password is never exported
 php_dump carp.php '
