@@ -1,0 +1,4 @@
+states        hard limit   400000
+src-nodes     hard limit   400000
+frags         hard limit     5000
+table-entries hard limit   400000
