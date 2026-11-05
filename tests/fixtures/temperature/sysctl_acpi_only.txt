@@ -1,0 +1,7 @@
+dev.cpu.1.freq: 1600
+dev.cpu.1.%desc: ACPI CPU
+dev.cpu.0.freq: 1600
+dev.cpu.0.%desc: ACPI CPU
+hw.acpi.thermal.tz1.temperature: 55.1C
+hw.acpi.thermal.tz0.temperature: 52.3C
+hw.acpi.thermal.min_runtime: 0

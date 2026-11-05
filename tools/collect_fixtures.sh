@@ -268,6 +268,9 @@ cmd_dump ntpq.txt /usr/local/sbin/ntpq -pnw
 cmd_dump crash_files.txt ls -la /var/crash
 cmd_dump php_errors_tail.txt sh -c 'ls -l /tmp/PHP_errors.log && tail -n 20 /tmp/PHP_errors.log'
 
+# --- temperature
+cmd_dump sysctl_temperature.txt /sbin/sysctl -q dev.cpu hw.acpi.thermal
+
 # --- carp
 # Only the fields used by check_pfsense: the VIP password is never exported
 php_dump carp.php '

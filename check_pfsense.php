@@ -3105,6 +3105,82 @@ function cp_evaluate_crash(array $data, array $options): CPResult
 }
 
 /* ======================================================================
+ * Subcommand: temperature
+ * ====================================================================== */
+
+/** @return array{sysctl: string} */
+function cp_collect_temperature(array $options): array
+{
+    // -q: no error for missing nodes (no coretemp/amdtemp driver, no ACPI)
+    $result = cp_run(['/sbin/sysctl', '-q', 'dev.cpu', 'hw.acpi.thermal'], $options['timeout']);
+    return ['sysctl' => $result['stdout']];
+}
+
+/**
+ * Temperatures from sysctl: CPU cores (dev.cpu.N.temperature) and ACPI
+ * thermal zones (hw.acpi.thermal.tzN.temperature), in Celsius. Negative
+ * values are not valid readings (like get_temp() of the dashboard).
+ *
+ * @return array{cpu: array<int, float>, acpi: array<int, float>}
+ */
+function cp_parse_temperatures(string $output): array
+{
+    $result = ['cpu' => [], 'acpi' => []];
+    foreach (preg_split('/\R/', $output) as $line) {
+        if (preg_match('/^dev\.cpu\.(\d+)\.temperature:\s*([0-9.]+)C/', $line, $m)) {
+            $result['cpu'][(int) $m[1]] = (float) $m[2];
+        } elseif (preg_match('/^hw\.acpi\.thermal\.tz(\d+)\.temperature:\s*([0-9.]+)C/', $line, $m)) {
+            $result['acpi'][(int) $m[1]] = (float) $m[2];
+        }
+    }
+    ksort($result['cpu']);
+    ksort($result['acpi']);
+    return $result;
+}
+
+function cp_evaluate_temperature(array $data, array $options): CPResult
+{
+    $temps = cp_parse_temperatures((string) ($data['sysctl'] ?? ''));
+    $source = $options['source'] ?? 'auto';
+
+    // Like the dashboard: CPU sensors, otherwise ACPI thermal zones
+    $sensors = [];
+    if (in_array($source, ['auto', 'cpu', 'all'], true)) {
+        foreach ($temps['cpu'] as $core => $value) {
+            $sensors["cpu{$core}"] = $value;
+        }
+    }
+    if ($source === 'acpi' || $source === 'all' || ($source === 'auto' && !$sensors)) {
+        foreach ($temps['acpi'] as $zone => $value) {
+            $sensors["tz{$zone}"] = $value;
+        }
+    }
+
+    if (!$sensors) {
+        return new CPResult(CP_UNKNOWN, 'Temperature sensor not available: enable the thermal sensor driver in System > Advanced > Miscellaneous (coretemp or amdtemp)');
+    }
+
+    $max = max($sensors);
+    $hottest = array_search($max, $sensors, true);
+    $state = cp_threshold_state($max, $options['warn'], $options['crit']);
+
+    $perfdata = [cp_perf('max', $max, '', $options['warn'], $options['crit'])];
+    $long = [];
+    foreach ($sensors as $name => $value) {
+        $perfdata[] = cp_perf($name, $value, '', $options['warn'], $options['crit']);
+        $long[] = "{$name}: " . cp_format_number($value, 1) . ' C';
+    }
+
+    $message = sprintf(
+        'Maximum temperature %s C (%s), %d sensors',
+        cp_format_number($max, 1),
+        $hottest,
+        count($sensors)
+    );
+    return new CPResult($state, $message, $perfdata, $long);
+}
+
+/* ======================================================================
  * Subcommand: carp
  * ====================================================================== */
 
@@ -3730,6 +3806,30 @@ function cp_commands(): array
             ],
             'collect' => 'cp_collect_crash',
             'evaluate' => 'cp_evaluate_crash',
+        ],
+        'temperature' => [
+            'summary' => 'CPU temperature',
+            'description' => [
+                'Maximum temperature of the CPU cores (dev.cpu.N.temperature), or of',
+                'the ACPI thermal zones if there are no CPU sensors, like the',
+                'dashboard. -w/-c in Celsius. UNKNOWN if no sensor is available.',
+                'Perfdata: maximum and every sensor (Celsius, without unit).',
+            ],
+            'libs' => [],
+            'root' => true,
+            'thresholds' => [
+                'warning' => '70', 'critical' => '85',
+                'help_warning' => 'Warning threshold in Celsius',
+                'help_critical' => 'Critical threshold in Celsius',
+            ],
+            'options' => [
+                'source' => [
+                    'type' => 'choice', 'choices' => ['auto', 'cpu', 'acpi', 'all'], 'default' => 'auto', 'metavar' => 'SOURCE',
+                    'help' => 'Sensors to check: auto (CPU, or ACPI without CPU sensors), cpu, acpi or all, default: auto',
+                ],
+            ],
+            'collect' => 'cp_collect_temperature',
+            'evaluate' => 'cp_evaluate_temperature',
         ],
         'carp' => [
             'summary' => 'Status of the CARP virtual IPs',

@@ -1,0 +1,2 @@
+dev.cpu.0.freq: 2000
+dev.cpu.0.%desc: ACPI CPU
