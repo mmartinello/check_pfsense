@@ -2252,6 +2252,187 @@ function cp_evaluate_mbuf(array $data, array $options): CPResult
 }
 
 /* ======================================================================
+ * Subcommand: updates
+ * ====================================================================== */
+
+const CP_PKG_BIN = '/usr/local/sbin/pkg-static';
+const CP_UPDATES_CACHE_KEY = 'updates';
+const CP_UPDATES_DEFAULT_TTL = 21600;
+
+/**
+ * Parse "<name> <version>" lines of pkg query/rquery.
+ *
+ * @return array<string, string>
+ */
+function cp_parse_pkg_list(string $output): array
+{
+    $packages = [];
+    foreach (preg_split('/\R/', $output) as $line) {
+        $fields = preg_split('/\s+/', trim($line));
+        if (count($fields) === 2 && !isset($packages[$fields[0]])) {
+            $packages[$fields[0]] = $fields[1];
+        }
+    }
+    return $packages;
+}
+
+/**
+ * Packages checked for updates, with their kind, among the installed ones:
+ * the core and meta packages used by pfSense-upgrade -c for the system
+ * version, and the GUI packages (pfSense-pkg-*) of the Package Manager.
+ *
+ * @param array<string, string> $installed
+ *
+ * @return array<string, string> name => core|meta|package
+ */
+function cp_updates_packages(array $installed, string $product): array
+{
+    $names = [];
+    foreach (array_keys($installed) as $name) {
+        if (str_starts_with($name, "{$product}-kernel-") || str_starts_with($name, "{$product}-base")) {
+            $names[$name] = 'core';
+        } elseif (str_starts_with($name, "{$product}-pkg-")) {
+            $names[$name] = 'package';
+        }
+    }
+    // Meta package, like get_meta_pkg_name()
+    foreach (["{$product}-vmware", $product] as $meta) {
+        if (isset($installed[$meta])) {
+            $names[$meta] = 'meta';
+            break;
+        }
+    }
+    return $names;
+}
+
+/**
+ * Check for system and package updates.
+ *
+ * pfSense-upgrade -c and get_system_pkg_version() are not used: besides
+ * updating the repository catalog, pfSense-upgrade can upgrade pkg itself
+ * and create system notices. This only runs "pkg-static update" (catalog
+ * refresh) and compares installed and remote versions with read-only pkg
+ * commands. The result is cached (--cache-ttl).
+ */
+function cp_collect_updates(array $options): array
+{
+    $ttl = (int) ($options['cache-ttl'] ?? CP_UPDATES_DEFAULT_TTL);
+    $cached = cp_cache_get(CP_UPDATES_CACHE_KEY, $ttl);
+    if (is_array($cached) && isset($cached['checked'], $cached['packages'])) {
+        return $cached + ['cached' => true];
+    }
+
+    $timeout = $options['timeout'];
+    $update = cp_run([CP_PKG_BIN, 'update', '-q'], $timeout);
+    if ($update['code'] !== 0) {
+        $lines = array_filter(preg_split('/\R/', trim($update['stderr'] ?: $update['stdout'])));
+        throw new CPException('Cannot update the package repository catalog (repository not reachable?)' . ($lines ? ': ' . end($lines) : ''));
+    }
+
+    $product = function_exists('g_get') ? (string) g_get('product_name', 'pfSense') : 'pfSense';
+    $installed = cp_parse_pkg_list(cp_run_ok([CP_PKG_BIN, 'query', '-a', '%n %v'], $timeout));
+    $names = cp_updates_packages($installed, $product);
+
+    $remote = [];
+    if ($names) {
+        // -U: use the catalog just updated, no other repository access
+        $result = cp_run(array_merge([CP_PKG_BIN, 'rquery', '-U', '%n %v'], array_keys($names)), $timeout);
+        $remote = cp_parse_pkg_list($result['stdout']);
+    }
+
+    $packages = [];
+    foreach ($names as $name => $kind) {
+        $local = $installed[$name];
+        $available = $remote[$name] ?? null;
+        if ($available === null) {
+            $compare = '?';
+        } elseif ($available === $local) {
+            $compare = '=';
+        } else {
+            $compare = trim(cp_run_ok([CP_PKG_BIN, 'version', '-t', $local, $available], $timeout));
+        }
+        $packages[] = ['name' => $name, 'kind' => $kind, 'installed' => $local, 'available' => $available, 'compare' => $compare];
+    }
+
+    $data = ['checked' => time(), 'product' => $product, 'packages' => $packages];
+    if ($ttl > 0) {
+        // A cache error does not invalidate the check
+        try {
+            cp_cache_set(CP_UPDATES_CACHE_KEY, $data);
+        } catch (CPException $e) {
+            $data['cache_error'] = $e->getMessage();
+        }
+    }
+    return $data + ['cached' => false];
+}
+
+function cp_evaluate_updates(array $data, array $options): CPResult
+{
+    $packages = array_values(array_filter((array) ($data['packages'] ?? []), fn ($p) => is_array($p) && isset($p['name'], $p['kind'])));
+    $product = (string) ($data['product'] ?? 'pfSense');
+
+    $system = array_values(array_filter($packages, fn ($p) => in_array($p['kind'], ['core', 'meta'], true)));
+    if (!$system) {
+        return new CPResult(CP_UNKNOWN, "Cannot determine the {$product} version: no meta or core packages found");
+    }
+    $meta = array_values(array_filter($system, fn ($p) => $p['kind'] === 'meta'))[0] ?? null;
+    if ($meta !== null && $meta['available'] === null) {
+        return new CPResult(CP_UNKNOWN, "Package {$meta['name']} not found in the repository catalog");
+    }
+
+    $describe = fn ($p) => "{$p['name']} {$p['installed']} -> {$p['available']}";
+    $systemUpdates = array_values(array_filter($system, fn ($p) => $p['compare'] === '<'));
+    $guiPackages = empty($options['no-packages'])
+        ? array_values(array_filter($packages, fn ($p) => $p['kind'] === 'package'))
+        : [];
+    $packageUpdates = array_values(array_filter($guiPackages, fn ($p) => $p['compare'] === '<'));
+
+    $version = $meta['installed'] ?? $system[0]['installed'];
+    $texts = [];
+    if ($systemUpdates) {
+        // The meta package has the release version, otherwise a core package
+        $update = array_values(array_filter($systemUpdates, fn ($p) => $p['kind'] === 'meta'))[0] ?? $systemUpdates[0];
+        $texts[] = "{$product} update available: {$update['installed']} -> {$update['available']}";
+    }
+    if ($packageUpdates) {
+        $texts[] = 'package updates available: ' . implode(', ', array_map($describe, $packageUpdates));
+    }
+
+    $summary = $systemUpdates ? [] : ["{$product} {$version} is up to date"];
+    if (!empty($options['no-packages'])) {
+        $summary[] = 'packages not checked';
+    } else {
+        $summary[] = sprintf('%d/%d packages up to date', count($guiPackages) - count($packageUpdates), count($guiPackages));
+    }
+
+    $long = [];
+    foreach (array_merge($system, $guiPackages) as $p) {
+        $status = match ($p['compare']) {
+            '<' => "update available ({$p['available']})",
+            '>' => "newer than the repository ({$p['available']})",
+            '=' => 'up to date',
+            default => 'not found in the repository catalog',
+        };
+        $long[] = "{$p['name']} {$p['installed']}: {$status}";
+    }
+    if (isset($data['checked'])) {
+        $age = max(0, time() - (int) $data['checked']);
+        $long[] = 'Checked ' . cp_format_duration($age) . ' ago' . (!empty($data['cached']) ? ' (cached)' : '');
+    }
+    if (!empty($data['cache_error'])) {
+        $long[] = $data['cache_error'];
+    }
+
+    $state = ($systemUpdates || $packageUpdates) ? CP_WARNING : CP_OK;
+    $perfdata = [
+        cp_perf('system_updates', count($systemUpdates) > 0 ? 1 : 0, '', null, null, 0, 1),
+        cp_perf('package_updates', count($packageUpdates), '', null, null, 0),
+    ];
+
+    return new CPResult($state, implode('; ', array_merge($texts, [implode(', ', $summary)])), $perfdata, $long);
+}
+
+/* ======================================================================
  * Subcommand: carp
  * ====================================================================== */
 
@@ -2742,6 +2923,34 @@ function cp_commands(): array
             ],
             'collect' => 'cp_collect_mbuf',
             'evaluate' => 'cp_evaluate_mbuf',
+        ],
+        'updates' => [
+            'summary' => 'Available system and package updates',
+            'description' => [
+                'Updates the repository catalog (pkg-static update, nothing else) and',
+                'compares installed and available versions of the core and meta',
+                'packages (system version, like pfSense-upgrade -c) and of the GUI',
+                'packages (pfSense-pkg-*). WARNING if an update is available; UNKNOWN',
+                'if the repository is not reachable. The result is cached in',
+                CP_CACHE_DIR . ' (--cache-ttl). The catalog update can take a',
+                'while: use a longer timeout (example: -t 60) and NRPE timeout.',
+                'Perfdata: system update available (0/1) and package updates.',
+            ],
+            'libs' => ['globals.inc'],
+            'root' => true,
+            'thresholds' => null,
+            'options' => [
+                'cache-ttl' => [
+                    'type' => 'int', 'default' => CP_UPDATES_DEFAULT_TTL, 'metavar' => 'SEC',
+                    'help' => 'Cache lifetime in seconds, 0 disables the cache (default: ' . CP_UPDATES_DEFAULT_TTL . ')',
+                ],
+                'no-packages' => [
+                    'type' => 'flag',
+                    'help' => 'Check only the system version, not the GUI packages',
+                ],
+            ],
+            'collect' => 'cp_collect_updates',
+            'evaluate' => 'cp_evaluate_updates',
         ],
         'carp' => [
             'summary' => 'Status of the CARP virtual IPs',

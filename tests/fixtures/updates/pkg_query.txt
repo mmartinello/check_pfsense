@@ -1,0 +1,16 @@
+curl 8.11.1
+nrpe 4.1.1
+pfSense 2.8.1
+pfSense-base 2.8.1
+pfSense-boot 2.8.1
+pfSense-default-config 2.8.1
+pfSense-kernel-pfSense 2.8.1
+pfSense-pkg-Status_Traffic_Totals 2.3.2_6
+pfSense-pkg-WireGuard 0.2.6
+pfSense-pkg-nrpe 2.4.1_1
+pfSense-pkg-sudo 0.3_10
+pfSense-repo 2.8.1
+pfSense-upgrade 1.3.8
+php83 8.3.19
+pkg 2.1.2
+sudo 1.9.16p2_1

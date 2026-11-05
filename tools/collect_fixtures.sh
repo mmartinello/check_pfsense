@@ -190,6 +190,12 @@ cmd_dump drill_nxdomain.txt /usr/bin/drill @127.0.0.1 nonexistent.invalid A
 # --- mbuf
 cmd_dump netstat_m.txt /usr/bin/netstat -m
 
+# --- updates
+# Read-only: installed packages and the local copy of the repository
+# catalog (-U: no catalog update, unlike the check)
+cmd_dump pkg_query.txt /usr/local/sbin/pkg-static query -a '%n %v'
+cmd_dump pkg_rquery.txt sh -c "/usr/local/sbin/pkg-static rquery -U '%n %v' \$(/usr/local/sbin/pkg-static query -a '%n' | grep -E '^pfSense(-vmware|-base.*|-kernel-.*|-pkg-.*)?\$')"
+
 # --- carp
 # Only the fields used by check_pfsense: the VIP password is never exported
 php_dump carp.php '
