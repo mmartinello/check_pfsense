@@ -670,6 +670,11 @@ function cp_prepare_options(string $command, array $def, array $options): array
     $options['crit'] = ($crit !== null) ? CPThreshold::parse((string) $crit, '-c') : null;
     cp_check_threshold_order($options['warn'], $options['crit']);
 
+    // Subcommand specific checks
+    if (isset($def['validate'])) {
+        ($def['validate'])($options);
+    }
+
     return $options;
 }
 
@@ -1501,6 +1506,182 @@ function cp_evaluate_services(array $data, array $options): CPResult
 }
 
 /* ======================================================================
+ * Subcommand: openvpn
+ * ====================================================================== */
+
+/**
+ * Collect the OpenVPN instances like status_openvpn.php, with the
+ * read-only functions of openvpn.inc (they send "status 2" and "state 1"
+ * to the management socket of every enabled instance).
+ *
+ * @return array{servers: array, p2p_servers: array, clients: array}
+ */
+function cp_collect_openvpn(array $options): array
+{
+    foreach (['openvpn_get_active_servers', 'openvpn_get_active_clients'] as $function) {
+        if (!function_exists($function)) {
+            throw new CPException("Function {$function}() not found: unsupported pfSense version");
+        }
+    }
+
+    $mode = $options['mode'] ?? 'all';
+    $servers = ($mode !== 'client');
+    $clients = ($mode !== 'server');
+
+    return [
+        'servers' => $servers ? openvpn_get_active_servers('multipoint') : [],
+        'p2p_servers' => $servers ? openvpn_get_active_servers('p2p') : [],
+        'clients' => $clients ? openvpn_get_active_clients() : [],
+    ];
+}
+
+/**
+ * Normalize the OpenVPN instances returned by openvpn.inc.
+ *
+ * Multipoint servers: an unreachable daemon is reported by
+ * openvpn_get_server_status() as a connection with common name "[error]".
+ * P2P servers and clients: "state" is set only if the daemon answered.
+ *
+ * @return array<int, array>
+ */
+function cp_openvpn_instances(array $data): array
+{
+    $instances = [];
+
+    foreach ((array) ($data['servers'] ?? []) as $server) {
+        if (!is_array($server)) {
+            continue;
+        }
+        $conns = array_values(array_filter((array) ($server['conns'] ?? []), 'is_array'));
+        $reachable = !in_array('[error]', array_column($conns, 'common_name'), true);
+        $conns = $reachable ? $conns : [];
+        $instances[] = [
+            'type' => 'server',
+            'mode' => 'multipoint',
+            'id' => 'server' . ($server['vpnid'] ?? ''),
+            'vpnid' => (string) ($server['vpnid'] ?? ''),
+            'name' => trim((string) ($server['name'] ?? '')),
+            'reachable' => $reachable,
+            'state' => null,
+            'status' => null,
+            'clients' => array_map(fn ($c) => [
+                'common_name' => trim((string) ($c['common_name'] ?? '')),
+                'user_name' => trim((string) ($c['user_name'] ?? '')),
+                'remote_host' => trim((string) ($c['remote_host'] ?? '')),
+                'virtual_addr' => trim((string) ($c['virtual_addr'] ?? '')),
+            ], $conns),
+            'bytes_recv' => array_sum(array_map(fn ($c) => (float) trim((string) ($c['bytes_recv'] ?? 0)), $conns)),
+            'bytes_sent' => array_sum(array_map(fn ($c) => (float) trim((string) ($c['bytes_sent'] ?? 0)), $conns)),
+        ];
+    }
+
+    foreach (['p2p_servers' => 'server', 'clients' => 'client'] as $key => $type) {
+        foreach ((array) ($data[$key] ?? []) as $instance) {
+            if (!is_array($instance)) {
+                continue;
+            }
+            $state = isset($instance['state']) ? trim((string) $instance['state']) : null;
+            $instances[] = [
+                'type' => $type,
+                'mode' => 'p2p',
+                'id' => $type . ($instance['vpnid'] ?? ''),
+                'vpnid' => (string) ($instance['vpnid'] ?? ''),
+                'name' => trim((string) ($instance['name'] ?? '')),
+                'reachable' => $state !== null && $state !== '',
+                'state' => $state,
+                'status' => trim((string) ($instance['status'] ?? '')),
+                'remote_host' => trim((string) ($instance['remote_host'] ?? '')),
+                'virtual_addr' => trim((string) ($instance['virtual_addr'] ?? '')),
+                'clients' => [],
+                'bytes_recv' => (float) trim((string) ($instance['bytes_recv'] ?? 0)),
+                'bytes_sent' => (float) trim((string) ($instance['bytes_sent'] ?? 0)),
+            ];
+        }
+    }
+
+    return $instances;
+}
+
+function cp_evaluate_openvpn(array $data, array $options): CPResult
+{
+    $warn = $options['warn'];
+    $crit = $options['crit'];
+    if (isset($options['min-clients'])) {
+        $crit = CPThreshold::parse($options['min-clients'] . ':', '--min-clients');
+    }
+
+    $mode = $options['mode'] ?? 'all';
+    $items = [];
+    $perfdata = [];
+    $total = 0;
+    $up = 0;
+
+    foreach (cp_openvpn_instances($data) as $vpn) {
+        if (($mode === 'server' && $vpn['type'] !== 'server') || ($mode === 'client' && $vpn['type'] !== 'client')) {
+            continue;
+        }
+        $total++;
+        if (!cp_filter_match([$vpn['id'], $vpn['vpnid'], $vpn['name']], $options['include'] ?? [], $options['exclude'] ?? [])) {
+            continue;
+        }
+
+        $label = $vpn['id'] . ($vpn['name'] !== '' ? " ({$vpn['name']})" : '');
+        $bytes = sprintf('in %s, out %s', cp_format_bytes($vpn['bytes_recv']), cp_format_bytes($vpn['bytes_sent']));
+
+        if (!$vpn['reachable']) {
+            $state = CP_CRITICAL;
+            $text = "{$vpn['id']} daemon not responding";
+            $detail = "{$label}: daemon not responding (service not running?)";
+        } elseif ($vpn['mode'] === 'multipoint') {
+            $count = count($vpn['clients']);
+            $state = cp_threshold_state($count, $warn, $crit);
+            $text = "{$vpn['id']} {$count} clients" . ($state !== CP_OK ? ' (threshold ' . ($state === CP_CRITICAL ? $crit->spec : $warn->spec) . ')' : '');
+            $names = array_map(fn ($c) => $c['common_name'] . ($c['remote_host'] !== '' ? "@{$c['remote_host']}" : ''), $vpn['clients']);
+            $detail = "{$label}: {$count} clients connected, {$bytes}" . ($names ? ' (' . implode(', ', $names) . ')' : '');
+            $perfdata[] = cp_perf("{$vpn['id']}_clients", $count, '', $warn, $crit, 0);
+        } elseif ($vpn['state'] === 'CONNECTED') {
+            $state = CP_OK;
+            $text = "{$vpn['id']} up";
+            $detail = "{$label}: up, remote {$vpn['remote_host']}, virtual address {$vpn['virtual_addr']}, {$bytes}";
+        } else {
+            $state = CP_CRITICAL;
+            $status = $vpn['status'] !== '' ? $vpn['status'] : $vpn['state'];
+            $text = "{$vpn['id']} down ({$status})";
+            $detail = "{$label}: down ({$status})";
+        }
+
+        if ($state === CP_OK) {
+            $up++;
+        }
+        $items[] = ['state' => $state, 'text' => $text, 'detail' => $detail];
+        $perfdata[] = cp_perf("{$vpn['id']}_bytes_in", $vpn['bytes_recv'], 'c', null, null, 0);
+        $perfdata[] = cp_perf("{$vpn['id']}_bytes_out", $vpn['bytes_sent'], 'c', null, null, 0);
+    }
+
+    if ($total === 0) {
+        return new CPResult(CP_UNKNOWN, 'No enabled OpenVPN instances found');
+    }
+    if (!$items) {
+        return new CPResult(CP_UNKNOWN, 'No OpenVPN instances match the include/exclude filters');
+    }
+
+    $summary = sprintf('%d/%d OpenVPN instances OK', $up, count($items));
+    return cp_aggregate($items, $summary, $perfdata);
+}
+
+/** Human readable size (for messages, not for perfdata). */
+function cp_format_bytes(float $bytes): string
+{
+    $units = ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB'];
+    $unit = 0;
+    while ($bytes >= 1024 && $unit < count($units) - 1) {
+        $bytes /= 1024;
+        $unit++;
+    }
+    return cp_format_number(round($bytes, 1), 1) . ' ' . $units[$unit];
+}
+
+/* ======================================================================
  * Subcommand: carp
  * ====================================================================== */
 
@@ -1843,6 +2024,46 @@ function cp_commands(): array
             'options' => cp_filter_options('services (by name or description)'),
             'collect' => 'cp_collect_services',
             'evaluate' => 'cp_evaluate_services',
+        ],
+        'openvpn' => [
+            'summary' => 'Status of the OpenVPN servers and clients',
+            'description' => [
+                'Same instances of Status > OpenVPN (disabled instances are skipped).',
+                'Clients and peer to peer servers: CRITICAL if not connected.',
+                'Multipoint servers: CRITICAL if the daemon does not answer on the',
+                'management socket; -w/-c (or --min-clients) on the connected clients.',
+                'Instances are identified as server<vpnid> or client<vpnid>; filters',
+                'match the identifier, the vpnid or the description.',
+                'Perfdata: connected clients, bytes in/out (counters).',
+            ],
+            'libs' => ['config.inc', 'openvpn.inc'],
+            'root' => true,
+            'thresholds' => [
+                'warning' => null, 'critical' => null,
+                'help_warning' => 'Range for the clients connected to every multipoint server (example: 2: warns below 2 clients)',
+                'help_critical' => 'Range for the clients connected to every multipoint server (example: 1: is critical without clients)',
+            ],
+            'options' => cp_filter_options('instances (server1, client2, vpnid or description)') + [
+                'mode' => [
+                    'type' => 'choice', 'choices' => ['server', 'client', 'all'],
+                    'default' => 'all', 'metavar' => 'MODE',
+                    'help' => 'Check only servers or only clients, default: all',
+                ],
+                'min-clients' => [
+                    'type' => 'int', 'metavar' => 'N',
+                    'help' => 'Critical if a multipoint server has less than N clients (same as -c N:)',
+                ],
+            ],
+            'validate' => function (array $options): void {
+                if (isset($options['min-clients']) && $options['critical'] !== null) {
+                    throw new CPUsageException('--min-clients and -c cannot be used together');
+                }
+                if (isset($options['min-clients']) && $options['warn'] !== null) {
+                    cp_check_threshold_order($options['warn'], CPThreshold::parse($options['min-clients'] . ':', '--min-clients'));
+                }
+            },
+            'collect' => 'cp_collect_openvpn',
+            'evaluate' => 'cp_evaluate_openvpn',
         ],
         'carp' => [
             'summary' => 'Status of the CARP virtual IPs',

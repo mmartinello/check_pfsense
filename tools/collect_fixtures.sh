@@ -106,6 +106,19 @@ php_dump services.php '
     }
     echo "<?php\nreturn ", var_export(["services" => $result], true), ";\n";
 '
+# --- openvpn
+# Contains user names and remote IP addresses of the connected clients:
+# anonymize them before sharing
+php_dump openvpn.php '
+    require_once("config.inc");
+    require_once("openvpn.inc");
+    echo "<?php\nreturn ", var_export([
+        "servers" => openvpn_get_active_servers("multipoint"),
+        "p2p_servers" => openvpn_get_active_servers("p2p"),
+        "clients" => openvpn_get_active_clients(),
+    ], true), ";\n";
+'
+
 # --- carp
 # Only the fields used by check_pfsense: the VIP password is never exported
 php_dump carp.php '
