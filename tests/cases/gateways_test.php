@@ -32,7 +32,7 @@ return [
         assert_not_contains('LTE_GW_delay', $output, 'unmonitored gateways have no perfdata');
         assert_not_contains('Null4', $output);
         assert_contains('[OK] LTE_GW (LTE modem, LTE, gateway 192.0.2.1): online (unmonitored)', $output);
-        assert_contains('monitor 1.1.1.1, default): online, delay 12.345ms', $output);
+        assert_contains('monitor 192.0.2.53, default): online, delay 12.345ms', $output);
     },
 
     'latency over the gateway low threshold is warning' => function () {
@@ -165,5 +165,31 @@ return [
         assert_same(null, cp_dpinger_parse('WAN 1 2'));
         assert_same(null, cp_dpinger_parse(null));
         assert_same(null, cp_dpinger_parse('WAN a b c'));
+    },
+
+    'real data pfSense 2.8.1: all online' => function () {
+        $result = cp_evaluate_gateways(fixture('gateways/pfsense-2.8.1.php'), options_for('gateways'));
+        assert_same(CP_OK, $result->state);
+        assert_same('4/4 gateways online', $result->message);
+        $output = assert_valid_output($result, true);
+        assert_contains("'GW_WAN_1_delay'=4.941ms;200;500;0", $output);
+        assert_contains("'OpenVPN_AS_stddev'=0.054ms;;;0", $output);
+        assert_not_contains('VPN_M2M_VPNV4_', $output, 'monitor_disable => true (bool) is unmonitored');
+        assert_contains('[OK] VPN_M2M_VPNV4 (Interface VPN_M2M_VPNV4 Gateway, VPN_M2M, gateway 10.3.0.1): online (unmonitored)', $output);
+        assert_contains('monitor 192.0.2.53, default): online', $output);
+    },
+
+    'real data pfSense 2.8.1: tier 1 down, dpinger of tier 2 restarting' => function () {
+        $data = fixture('gateways/pfsense-2.8.1.php');
+        $data['dpinger']['GW_WAN_1']['raw'] = 'GW_WAN_1 0 0 100';
+        $data['dpinger']['GW_WAN_2']['raw'] = 'GW_WAN_2 0 0 0';
+        $data['dpinger']['GW_WAN_2']['error'] = 'dpinger is still initializing';
+        $result = cp_evaluate_gateways($data, options_for('gateways', ['--exclude', 'OpenVPN*']));
+        assert_same(CP_CRITICAL, $result->state);
+        assert_same(
+            'GW_WAN_1 offline (packet loss) (delay 0ms, loss 100%), GW_WAN_2 pending (dpinger is still initializing); 1/3 gateways online',
+            $result->message
+        );
+        assert_valid_output($result, true);
     },
 ];

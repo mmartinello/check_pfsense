@@ -21,7 +21,7 @@ return [
             'name' => 'WAN_DHCP',
             'attribute' => 'system',
             'descr' => 'Interface WAN_DHCP Gateway',
-            'monitor' => '1.1.1.1',
+            'monitor' => '192.0.2.53',
             'isdefaultgw' => true,
             'tiername' => 'Default (IPv4)',
         ],
@@ -32,7 +32,7 @@ return [
             'weight' => '1',
             'ipprotocol' => 'inet',
             'descr' => 'Fiber backup',
-            'monitor' => '8.8.4.4',
+            'monitor' => '198.51.100.53',
             'latencylow' => '100',
             'latencyhigh' => '300',
             'losslow' => '5',
@@ -66,13 +66,13 @@ return [
     'dpinger' => [
         'WAN_DHCP' => [
             'srcip' => '203.0.113.20',
-            'targetip' => '1.1.1.1',
+            'targetip' => '192.0.2.53',
             'raw' => 'WAN_DHCP 12345 2100 0',
             'error' => null,
         ],
         'FIBER_GW' => [
             'srcip' => '198.51.100.10',
-            'targetip' => '8.8.4.4',
+            'targetip' => '198.51.100.53',
             'raw' => 'FIBER_GW 8250 900 0',
             'error' => null,
         ],
