@@ -669,6 +669,16 @@ function cp_prepare_options(string $command, array $def, array $options): array
         return $options;
     }
 
+    // Subcommands with their own threshold semantics validate -w/-c
+    if (!empty($thresholds['custom'])) {
+        $options['warn'] = null;
+        $options['crit'] = null;
+        if (isset($def['validate'])) {
+            ($def['validate'])($options);
+        }
+        return $options;
+    }
+
     $warn = $options['warning'] ?? $thresholds['warning'] ?? null;
     $crit = $options['critical'] ?? $thresholds['critical'] ?? null;
     // Metrics where a low value is a problem: a plain number N means "N:"
@@ -3606,6 +3616,179 @@ function cp_evaluate_haproxy(array $data, array $options): CPResult
 }
 
 /* ======================================================================
+ * Subcommand: speedtest
+ * ====================================================================== */
+
+const CP_SPEEDTEST_FILE = '/var/db/speedtest.json';
+
+/**
+ * Read the result of the speedtest cron job. The test is never run.
+ *
+ * @return array{exists: bool, file: string, content: ?string, mtime: ?int, now: int}
+ */
+function cp_collect_speedtest(array $options): array
+{
+    $file = $options['file'] ?? CP_SPEEDTEST_FILE;
+    if (!is_file($file)) {
+        return ['exists' => false, 'file' => $file, 'content' => null, 'mtime' => null, 'now' => time()];
+    }
+    $content = @file_get_contents($file);
+    if ($content === false) {
+        throw new CPException("Cannot read speedtest file: {$file}");
+    }
+    return ['exists' => true, 'file' => $file, 'content' => $content, 'mtime' => (int) filemtime($file), 'now' => time()];
+}
+
+/**
+ * Speed in Mbit/s like check_speedtest.py: Ookla speedtest gives an
+ * object with the bandwidth in byte/s, speedtest-cli a speed in bit/s.
+ */
+function cp_speedtest_speed(array $result, string $key): ?float
+{
+    $value = $result[$key] ?? null;
+    if (is_array($value)) {
+        $value = $value['bandwidth'] ?? null;
+        $divisor = 125000;
+    } else {
+        $divisor = 1000000;
+    }
+    if ($value === null) {
+        return null;
+    }
+    if (!is_numeric($value)) {
+        throw new CPException("Invalid {$key} value in speedtest output: " . json_encode($value));
+    }
+    return round((float) $value / $divisor, 2);
+}
+
+/** Format a float like str(float) of Python (940.0, 20.5), as check_speedtest.py does. */
+function cp_py_float(float $value): string
+{
+    $text = cp_format_number($value, 10);
+    return str_contains($text, '.') ? $text : $text . '.0';
+}
+
+function cp_evaluate_speedtest(array $data, array $options): CPResult
+{
+    $file = (string) ($data['file'] ?? CP_SPEEDTEST_FILE);
+    if (empty($data['exists'])) {
+        return new CPResult(CP_UNKNOWN, "Speedtest file {$file} not found (is the speedtest cron job configured?)");
+    }
+
+    if (isset($options['max-age'])) {
+        $age = (($data['now'] ?? time()) - (int) $data['mtime']) / 60;
+        if ($age > $options['max-age']) {
+            return new CPResult(CP_UNKNOWN, sprintf('Speedtest file %s is too old: %.1f minutes (max age: %d minutes)', $file, $age, $options['max-age']));
+        }
+    }
+
+    $result = json_decode((string) $data['content'], true);
+    if (!is_array($result) || array_is_list($result) && $result !== []) {
+        return new CPResult(CP_UNKNOWN, 'Invalid speedtest JSON output' . (json_last_error() !== JSON_ERROR_NONE ? ': ' . json_last_error_msg() : ': not an object'));
+    }
+
+    $download = cp_speedtest_speed($result, 'download');
+    if ($download === null) {
+        return new CPResult(CP_UNKNOWN, 'No download speed in speedtest output');
+    }
+    $upload = cp_speedtest_speed($result, 'upload');
+    if ($upload === null) {
+        return new CPResult(CP_UNKNOWN, 'No upload speed in speedtest output');
+    }
+
+    // Ping and server are informative only
+    $ping = is_array($result['ping'] ?? null) ? ($result['ping']['latency'] ?? null) : ($result['ping'] ?? null);
+    $ping = is_numeric($ping) ? round((float) $ping, 2) : null;
+    $server = null;
+    if (is_array($result['server'] ?? null)) {
+        $names = array_filter([$result['server']['sponsor'] ?? null, $result['server']['name'] ?? null, $result['server']['location'] ?? null]);
+        $server = $names ? implode(', ', array_map('strval', $names)) : null;
+    }
+
+    $level = function (float $speed, ?float $warning, ?float $critical): int {
+        if ($critical !== null && $speed < $critical) {
+            return CP_CRITICAL;
+        }
+        if ($warning !== null && $speed < $warning) {
+            return CP_WARNING;
+        }
+        return CP_OK;
+    };
+    $dw = isset($options['warning']) ? (float) $options['warning'] : null;
+    $dc = isset($options['critical']) ? (float) $options['critical'] : null;
+    $uw = $options['upload-warning'] ?? null;
+    $uc = $options['upload-critical'] ?? null;
+    $downloadLevel = $level($download, $dw, $dc);
+    $uploadLevel = $level($upload, $uw, $uc);
+
+    $tag = fn (int $state) => $state === CP_OK ? '' : ' [' . CP_STATE_NAMES[$state] . ']';
+    $message = sprintf(
+        'Download speed: %s Mbit/sec%s, Upload speed: %s Mbit/sec%s',
+        cp_py_float($download),
+        $tag($downloadLevel),
+        cp_py_float($upload),
+        $tag($uploadLevel)
+    );
+    if ($ping !== null) {
+        $message .= ', Ping: ' . cp_py_float($ping) . ' ms';
+    }
+    if ($server !== null) {
+        $message .= " (server: {$server})";
+    }
+
+    // Levels are "x:" ranges: the alarm is raised below x; min and max only
+    // with a maximum speed, like check_speedtest.py
+    $perfItem = function (string $label, float $value, ?float $warning, ?float $critical, ?float $max): string {
+        $fields = [
+            cp_py_float($value),
+            $warning !== null ? cp_py_float($warning) . ':' : '',
+            $critical !== null ? cp_py_float($critical) . ':' : '',
+            $max !== null ? '0.0' : '',
+            $max !== null ? cp_py_float($max) : '',
+        ];
+        return "'{$label}'=" . rtrim(implode(';', $fields), ';');
+    };
+    $perfdata = [
+        $perfItem('download_speed', $download, $dw, $dc, $options['download-max'] ?? null),
+        $perfItem('upload_speed', $upload, $uw, $uc, $options['upload-max'] ?? null),
+    ];
+    if ($ping !== null) {
+        $perfdata[] = "'ping'=" . cp_py_float($ping) . 'ms;;;0';
+    }
+
+    return new CPResult(cp_worst_state($downloadLevel, $uploadLevel), $message, $perfdata);
+}
+
+/** Validate the speedtest levels with the same rules of check_speedtest.py. */
+function cp_validate_speedtest(array $options): void
+{
+    foreach (['warning' => '-w', 'critical' => '-c'] as $name => $flag) {
+        if ($options[$name] !== null && !is_numeric($options[$name])) {
+            throw new CPUsageException("Option {$flag} requires a speed in Mbit/s, got '{$options[$name]}'");
+        }
+    }
+    $dw = $options['warning'] !== null ? (float) $options['warning'] : null;
+    $dc = $options['critical'] !== null ? (float) $options['critical'] : null;
+    $checks = [
+        ['Download', $dw, $dc, $options['download-max'] ?? null],
+        ['Upload', $options['upload-warning'] ?? null, $options['upload-critical'] ?? null, $options['upload-max'] ?? null],
+    ];
+    foreach ($checks as [$what, $warning, $critical, $max]) {
+        if ($warning !== null && $critical !== null && $warning <= $critical) {
+            throw new CPUsageException("{$what} warning level must be bigger than {$what} critical level");
+        }
+        foreach (['critical' => $critical, 'warning' => $warning] as $kind => $level) {
+            if ($max !== null && $level !== null && $max < $level) {
+                throw new CPUsageException("{$what} max level cannot be lower than {$what} {$kind} level");
+            }
+        }
+    }
+    if (isset($options['max-age']) && $options['max-age'] < 0) {
+        throw new CPUsageException('Max age must not be negative');
+    }
+}
+
+/* ======================================================================
  * Subcommand: carp
  * ====================================================================== */
 
@@ -3890,9 +4073,16 @@ function cp_evaluate_states(array $data, array $options): CPResult
  * Subcommand registry
  * ====================================================================== */
 
+/** Order of the subcommands in the help and in the list. */
+const CP_COMMAND_ORDER = [
+    'gateways', 'gateway-groups', 'services', 'openvpn', 'ipsec', 'wireguard', 'dns', 'carp', 'mbuf',
+    'states', 'updates', 'interfaces', 'certificates', 'ntp', 'notices', 'crash', 'temperature', 'zfs',
+    'memory', 'haproxy', 'speedtest', 'list',
+];
+
 function cp_commands(): array
 {
-    return [
+    $commands = [
         'gateways' => [
             'summary' => 'Status of the gateways monitored by dpinger',
             'description' => [
@@ -4324,6 +4514,54 @@ function cp_commands(): array
             'collect' => 'cp_collect_haproxy',
             'evaluate' => 'cp_evaluate_haproxy',
         ],
+        'speedtest' => [
+            'summary' => 'Result of the speedtest cron job (never runs the test)',
+            'description' => [
+                'Reads the JSON written by a cron job (speedtest-cli --json or the',
+                'Ookla speedtest --format=json) and checks it with the same logic',
+                'and options of check_speedtest.py: speeds in Mbit/s, alarm when a',
+                'speed is below the warning or critical level.',
+                'Perfdata: download and upload speed, ping.',
+            ],
+            'libs' => [],
+            'root' => true,
+            'thresholds' => [
+                'warning' => null, 'critical' => null,
+                'help_warning' => 'Download warning level in Mbit/s (example: 10 or 10.5)',
+                'help_critical' => 'Download critical level in Mbit/s (example: 2 or 2.5)',
+                // Levels are checked by cp_evaluate_speedtest()
+                'custom' => true,
+            ],
+            'options' => [
+                'upload-warning' => [
+                    'short' => 'W', 'type' => 'float', 'metavar' => 'MBIT',
+                    'help' => 'Upload warning level in Mbit/s (example: 2 or 2.5)',
+                ],
+                'upload-critical' => [
+                    'short' => 'C', 'type' => 'float', 'metavar' => 'MBIT',
+                    'help' => 'Upload critical level in Mbit/s (example: 1 or 1.5)',
+                ],
+                'download-max' => [
+                    'short' => 'm', 'type' => 'float', 'metavar' => 'MBIT',
+                    'help' => 'Maximum download level in Mbit/s for the connection',
+                ],
+                'upload-max' => [
+                    'short' => 'M', 'type' => 'float', 'metavar' => 'MBIT',
+                    'help' => 'Maximum upload level in Mbit/s for the connection',
+                ],
+                'max-age' => [
+                    'type' => 'int', 'metavar' => 'MINUTES',
+                    'help' => 'UNKNOWN if the file is older than the given minutes',
+                ],
+                'file' => [
+                    'type' => 'string', 'metavar' => 'PATH',
+                    'help' => 'Speedtest JSON file, default: ' . CP_SPEEDTEST_FILE,
+                ],
+            ],
+            'validate' => 'cp_validate_speedtest',
+            'collect' => 'cp_collect_speedtest',
+            'evaluate' => 'cp_evaluate_speedtest',
+        ],
         'carp' => [
             'summary' => 'Status of the CARP virtual IPs',
             'description' => [
@@ -4384,6 +4622,8 @@ function cp_commands(): array
             'evaluate' => 'cp_evaluate_list',
         ],
     ];
+
+    return array_merge(array_intersect_key(array_flip(CP_COMMAND_ORDER), $commands), $commands);
 }
 
 function cp_evaluate_list(array $data, array $options): CPResult

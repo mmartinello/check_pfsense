@@ -290,6 +290,9 @@ php_dump haproxy.php '
         "carpdev" => is_array($c) ? (string) ($c["carpdev"] ?? "") : "", "stat" => $stat], true), ";\n";
 '
 
+# --- speedtest (contains the public IP and the ISP: anonymize it)
+[ -f /var/db/speedtest.json ] && cp /var/db/speedtest.json "$OUT/speedtest.json"
+
 # --- carp
 # Only the fields used by check_pfsense: the VIP password is never exported
 php_dump carp.php '
