@@ -278,6 +278,18 @@ cmd_dump zpool_status.txt /sbin/zpool status -x
 # --- memory
 cmd_dump sysctl_memory.txt /sbin/sysctl hw.pagesize vm.stats.vm.v_page_count vm.stats.vm.v_active_count vm.stats.vm.v_wire_count vm.stats.vm.v_inactive_count vm.stats.vm.v_laundry_count vm.stats.vm.v_free_count
 
+# --- haproxy (read-only "show stat"; server addresses may need anonymizing)
+php_dump haproxy.php '
+    require_once("config.inc");
+    $c = config_get_path("installedpackages/haproxy");
+    $stat = null;
+    if (file_exists("/tmp/haproxy.socket") && ($fp = @stream_socket_client("unix:///tmp/haproxy.socket", $e, $s, 5))) {
+        stream_set_timeout($fp, 5); fwrite($fp, "show stat\n"); $stat = stream_get_contents($fp); fclose($fp);
+    }
+    echo "<?php\nreturn ", var_export(["installed" => is_array($c), "enabled" => is_array($c) && isset($c["enable"]),
+        "carpdev" => is_array($c) ? (string) ($c["carpdev"] ?? "") : "", "stat" => $stat], true), ";\n";
+'
+
 # --- carp
 # Only the fields used by check_pfsense: the VIP password is never exported
 php_dump carp.php '

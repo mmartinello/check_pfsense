@@ -3391,6 +3391,221 @@ function cp_evaluate_memory(array $data, array $options): CPResult
 }
 
 /* ======================================================================
+ * Subcommand: haproxy
+ * ====================================================================== */
+
+const CP_HAPROXY_SOCKET = '/tmp/haproxy.socket';
+
+/**
+ * Send a command to the HAProxy stats socket and return the answer.
+ * The package function haproxy_socket_command() is not used: it has no
+ * timeout and prints errors with echo.
+ */
+function cp_haproxy_command(string $socket, string $command, int $timeout): string
+{
+    if (!file_exists($socket)) {
+        throw new CPException("HAProxy stats socket {$socket} not found");
+    }
+    $fp = @stream_socket_client("unix://{$socket}", $errno, $errstr, $timeout);
+    if (!$fp) {
+        throw new CPException("Cannot connect to the HAProxy stats socket: {$errstr}");
+    }
+    stream_set_timeout($fp, $timeout);
+    fwrite($fp, "{$command}\n");
+    $output = stream_get_contents($fp);
+    $meta = stream_get_meta_data($fp);
+    fclose($fp);
+    if ($output === false || !empty($meta['timed_out'])) {
+        throw new CPException("Timeout reading the HAProxy stats socket after {$timeout} seconds");
+    }
+    return $output;
+}
+
+/**
+ * Collect HAProxy data: package settings and "show stat" (read-only).
+ *
+ * With "carpdev" HAProxy runs only on the node where that CARP VIP is
+ * MASTER (haproxy_carpipismaster() of the package): the VIP status is read
+ * like the carp subcommand, with a timeout.
+ */
+function cp_collect_haproxy(array $options): array
+{
+    $config = config_get_path('installedpackages/haproxy');
+    if (!is_array($config)) {
+        return ['installed' => false];
+    }
+
+    $carpdev = (string) ($config['carpdev'] ?? '');
+    $carpState = null;
+    if ($carpdev !== '') {
+        foreach (config_get_path('virtualip/vip', []) as $vip) {
+            if (is_array($vip) && ($vip['mode'] ?? '') === 'carp' && ($vip['subnet'] ?? '') === $carpdev) {
+                $real = (string) get_real_interface($vip['interface'] ?? '');
+                $ifconfig = ($real !== '') ? cp_run(['/sbin/ifconfig', $real], $options['timeout'])['stdout'] : '';
+                $carpState = cp_carp_vhid_state($ifconfig, (string) ($vip['vhid'] ?? ''));
+                break;
+            }
+        }
+    }
+
+    $socket = $options['socket'] ?? CP_HAPROXY_SOCKET;
+    $stat = null;
+    $error = null;
+    try {
+        $stat = cp_haproxy_command($socket, 'show stat', $options['timeout']);
+    } catch (CPException $e) {
+        $error = $e->getMessage();
+    }
+
+    return [
+        'installed' => true,
+        'enabled' => isset($config['enable']),
+        'carpdev' => $carpdev,
+        'carp_state' => $carpState,
+        'stat' => $stat,
+        'error' => $error,
+    ];
+}
+
+/**
+ * Parse the "show stat" CSV, using the header for the column names.
+ *
+ * @return array<int, array<string, string>>
+ */
+function cp_parse_haproxy_stat(string $output): array
+{
+    $lines = array_values(array_filter(preg_split('/\R/', $output), fn ($l) => trim($l) !== ''));
+    if (!$lines || !str_starts_with($lines[0], '# ')) {
+        return [];
+    }
+    $columns = explode(',', substr($lines[0], 2));
+    $rows = [];
+    foreach (array_slice($lines, 1) as $line) {
+        $values = explode(',', $line);
+        if (count($values) < 18) {
+            continue;
+        }
+        $row = [];
+        foreach ($columns as $i => $column) {
+            if ($column !== '') {
+                $row[$column] = $values[$i] ?? '';
+            }
+        }
+        $rows[] = $row;
+    }
+    return $rows;
+}
+
+function cp_evaluate_haproxy(array $data, array $options): CPResult
+{
+    if (empty($data['installed'])) {
+        return new CPResult(CP_UNKNOWN, 'HAProxy package is not installed');
+    }
+    if (empty($data['enabled'])) {
+        return new CPResult(CP_UNKNOWN, 'HAProxy is disabled in the package settings');
+    }
+
+    $carpdev = (string) ($data['carpdev'] ?? '');
+    if (($data['stat'] ?? null) === null) {
+        if ($carpdev !== '' && ($data['carp_state'] ?? '') !== 'MASTER') {
+            $state = ($data['carp_state'] ?? '') !== '' ? $data['carp_state'] : 'not found';
+            return new CPResult(CP_OK, "HAProxy is not running: it runs only on the CARP master of {$carpdev}, this node is {$state}");
+        }
+        return new CPResult(CP_CRITICAL, 'HAProxy is not running: ' . ($data['error'] ?? 'no statistics'));
+    }
+
+    $rows = cp_parse_haproxy_stat((string) $data['stat']);
+    if (!$rows) {
+        return new CPResult(CP_UNKNOWN, 'Cannot parse the HAProxy statistics');
+    }
+
+    // Group servers by backend
+    $backends = [];
+    $frontends = [];
+    foreach ($rows as $row) {
+        $proxy = $row['pxname'] ?? '';
+        $name = $row['svname'] ?? '';
+        if ($name === 'FRONTEND') {
+            $frontends[$proxy] = $row;
+        } elseif ($name === 'BACKEND') {
+            $backends[$proxy]['row'] = $row;
+        } else {
+            $backends[$proxy]['servers'][$name] = $row;
+        }
+    }
+
+    $items = [];
+    $perfdata = [];
+    $ok = 0;
+    $checked = 0;
+    $include = $options['include'] ?? [];
+    $exclude = $options['exclude'] ?? [];
+
+    if (!empty($options['frontends'])) {
+        foreach ($frontends as $name => $row) {
+            if (!cp_filter_match([$name], $include, $exclude)) {
+                continue;
+            }
+            $status = strtoupper($row['status'] ?? '');
+            $state = match (true) {
+                $status === 'OPEN' => CP_OK,
+                $status === 'FULL' => CP_WARNING,
+                default => CP_CRITICAL,
+            };
+            $items[] = ['state' => $state, 'text' => "frontend {$name} {$status}", 'detail' => "frontend {$name}: {$status}, {$row['scur']} sessions"];
+            $perfdata[] = cp_perf("{$name}_sessions", (float) ($row['scur'] ?? 0), '', null, null, 0, is_numeric($row['slim'] ?? null) ? (float) $row['slim'] : null);
+        }
+    }
+
+    foreach ($backends as $name => $backend) {
+        if (!isset($backend['row']) || !cp_filter_match([(string) $name], $include, $exclude)) {
+            continue;
+        }
+        $checked++;
+        $servers = $backend['servers'] ?? [];
+        $up = [];
+        $problems = [];
+        foreach ($servers as $server => $row) {
+            $status = trim($row['status'] ?? '');
+            $upper = strtoupper($status);
+            if (str_starts_with($upper, 'UP') || $upper === 'NO CHECK') {
+                $up[] = $server;
+            }
+            if (str_starts_with($upper, 'DOWN') || str_starts_with($upper, 'MAINT') || $upper === 'DRAIN' || $upper === 'NOLB'
+                || (str_starts_with($upper, 'UP ') && str_contains($upper, '/'))) {
+                $problems[] = "{$server} {$status}";
+            }
+        }
+
+        $backendStatus = strtoupper($backend['row']['status'] ?? '');
+        $counts = sprintf('%d/%d servers up', count($up), count($servers));
+        if ($backendStatus !== 'UP' || ($servers && !$up)) {
+            $state = CP_CRITICAL;
+            $text = "backend {$name} {$backendStatus} ({$counts}" . ($problems ? ': ' . implode(', ', $problems) : '') . ')';
+        } elseif ($problems) {
+            $state = CP_WARNING;
+            $text = "backend {$name} " . implode(', ', $problems);
+        } else {
+            $state = CP_OK;
+            $text = "backend {$name} {$counts}";
+            $ok++;
+        }
+        $serverText = implode(', ', array_map(fn ($s, $r) => "{$s} " . trim($r['status'] ?? ''), array_keys($servers), $servers));
+        $items[] = ['state' => $state, 'text' => $text, 'detail' => "backend {$name}: {$backendStatus}, {$counts}" . ($serverText !== '' ? " ({$serverText})" : '')];
+
+        $perfdata[] = cp_perf("{$name}_servers_up", count($up), '', null, null, 0, count($servers));
+        $perfdata[] = cp_perf("{$name}_sessions", (float) ($backend['row']['scur'] ?? 0), '', null, null, 0);
+    }
+
+    if (!$items) {
+        return new CPResult(CP_UNKNOWN, 'No HAProxy backends' . ($include || $exclude ? ' match the include/exclude filters' : ' found'));
+    }
+
+    $summary = sprintf('%d/%d backends OK', $ok, $checked);
+    return cp_aggregate($items, $summary, $perfdata);
+}
+
+/* ======================================================================
  * Subcommand: carp
  * ====================================================================== */
 
@@ -4080,6 +4295,34 @@ function cp_commands(): array
             'options' => [],
             'collect' => 'cp_collect_memory',
             'evaluate' => 'cp_evaluate_memory',
+        ],
+        'haproxy' => [
+            'summary' => 'Status of the HAProxy backends and servers (package)',
+            'description' => [
+                'Statistics from the HAProxy stats socket ("show stat"). CRITICAL if',
+                'a backend is not UP (no server available) or if HAProxy is not',
+                'running; WARNING if a server is DOWN, MAINT, DRAIN or NOLB. With the',
+                'package "carpdev" setting, a stopped HAProxy on the CARP backup node',
+                'is OK. With --frontends, CRITICAL if a frontend is not OPEN.',
+                'UNKNOWN if the package is not installed or disabled. Filters match',
+                'the backend (and frontend) name.',
+                'Perfdata: servers up and current sessions of every backend.',
+            ],
+            'libs' => ['config.inc', 'interfaces.inc'],
+            'root' => true,
+            'thresholds' => null,
+            'options' => cp_filter_options('backends') + [
+                'frontends' => [
+                    'type' => 'flag',
+                    'help' => 'Check the frontends too (CRITICAL if not OPEN, WARNING if FULL)',
+                ],
+                'socket' => [
+                    'type' => 'string', 'metavar' => 'PATH',
+                    'help' => 'HAProxy stats socket, default: ' . CP_HAPROXY_SOCKET . ' (set by the package)',
+                ],
+            ],
+            'collect' => 'cp_collect_haproxy',
+            'evaluate' => 'cp_evaluate_haproxy',
         ],
         'carp' => [
             'summary' => 'Status of the CARP virtual IPs',
